@@ -22,6 +22,7 @@ Optional: `pillow` lets `view_image` downscale big images.
 | `sbx/manager.py` | Resolves *defaults < profile < request*, enforces `[limits]`, owns lifecycle, TTL reaping, image allow-lists. |
 | `sbx/registry.py` | Durable per-sandbox records with `flock` locks. Sandboxes **survive server restarts**, and several server processes can share one `state_dir`. Only sandboxes in the registry are reachable, so the model can never touch other containers on your machine. |
 | `sbx/tools.py`, `sbx/server.py` | The MCP surface, HTTP transport (bearer token), CLI. |
+| `sbx/defaults.py` | Per-session defaults (`set_defaults`): argument values and output options set once instead of on every call. |
 
 Because the backends are stateless, you can still run three separate servers from one install, sharing a state dir:
 `--tools sandbox`, `--tools fs`, `--tools shell`.
@@ -110,6 +111,64 @@ Things to know:
 * A symlink inside a mapped folder is followed by the *sandbox*, in the sandbox's own filesystem, never on your host.
 * The mapping is fixed when the sandbox is created (stored in its record); editing the config later affects only new sandboxes.
 
+## Defaults: say it once
+
+Most calls repeat the same arguments (`sandbox`, `session`, ...) and get back the same framing (`exit code: 0  (0.02s)`,
+`--- stdout ---`, a grep footer, pretty-printed JSON). `set_defaults` fixes both for the rest of the session:
+
+```
+set_defaults(input={"sandbox": "work", "session": "dev"},
+             output={"status": false, "labels": false, "json": "compact"})
+run_command(command="make test")     # runs in sandbox "work", session "dev"; the result is just the program's output
+```
+
+Precedence, highest first: **an argument passed explicitly** > what the model set this session > `[defaults.*]` in the
+config > built-in. The server fills defaults in *before* a tool is called, so an explicit argument always wins and the tool
+schemas are unchanged. A `null` value removes a key (`output={"json": null}`), `reset=true` clears everything the model set,
+`show_defaults` shows what is in effect, and a bad key or value changes nothing and says what is valid.
+
+**Input defaults** fill an argument when it is omitted: `sandbox` (also the `name` of `sandbox_info/start/stop/extend`, so
+`sandbox_info()` works), `session`, `timeout_seconds`, `details`, `max_depth`, `max_lines`, `max_results`, `max_matches`,
+`regex`, `case_sensitive`, `dry_run`. Deliberately **not** defaultable: what to act on (`path`, `command`, `content`, ...)
+and anything that widens what a call may do (`overwrite`, `recursive`, `network`, `ports`, `mounts`, `env`, `cwd`):
+those stay a decision per call. `sandbox_destroy` always needs its name, and `reset_shell_session` ignores the `session`
+default (there, omitting it means "all sessions").
+
+**Output options** (what results contain):
+
+| key | default | effect |
+|---|---|---|
+| `status` | `true` | `run_command` exit-code line. `false` shows it only when something went wrong (non-zero exit, timeout, signal, kill) |
+| `duration` | `true` | the `(1.23s)` in that line |
+| `labels` | `true` | the `--- stdout ---` marker. `false` drops it when stdout is the only output (stderr is always labelled) |
+| `diff` | `full` | `edit_file` result: the unified diff, or `summary` = `edited PATH: 2 edit(s), +3 -1 lines` (a `dry_run` always shows the diff) |
+| `stats` | `true` | `grep`'s `[N matches; scanned ...]` footer. `false` keeps only why a search stopped early |
+| `json` | `pretty` | JSON results (`sandbox_*`, `check_command`, `shell_info`, `list_allowed_directories`): `compact` drops the indentation |
+
+Failures are never hidden: `status = false` removes the routine `exit code: 0`, but a failing, timed-out or killed command
+still reports it, a successful command with no output still says `(no output)`, and truncation notices stay.
+
+**Scope.** One MCP session, held in memory. stdio: the process. streamable-http: each client session separately. Behind
+[`router`](../router): the router's single upstream connection, so everything behind that router shares them and
+`restart_server` resets them (add `set_defaults` and `show_defaults` to the sandbox entry's `expose` list, or call them through
+`call_tool`). A server restart starts every session from `[defaults]` again. Each `set_defaults` call is in the audit log,
+and tool entries record the sandbox that was actually used.
+
+**Server-side**, for every session and with no `set_defaults` call from the model:
+
+```toml
+[defaults]
+adopt_created = true     # the first sandbox the model creates becomes its default (off unless you turn it on)
+[defaults.input]
+session = "dev"
+timeout_seconds = 120
+[defaults.output]
+status = false
+json = "compact"
+```
+The server-wide default sandbox stays `[tools] default_sandbox`; a value in `[defaults.input]` for `sandbox` is refused so there is only one place to look.
+The model can override any of these for itself and fall back to them again by clearing its own value.
+
 ## Security model (what is enforced where)
 
 * **Model controls only validated parameters.** It cannot pass raw `docker` flags, host paths, privileged mode, host
@@ -124,6 +183,7 @@ Things to know:
 * **Shell**: same classifier as `shell_mcp` (block / ask a human / allow, secret redaction, rate limit, concurrency cap). Network tools are judged against *that sandbox's* network mode.
 * **Shell sessions** (`sbx/session.py`): `run_command` carries the working directory and *exported* environment variables (`cd`, `export`, `unset`, PATH via e.g. `source venv/bin/activate`) from one call to the next, per named `session` (default `default`). State is captured at shell exit, held on the host and replayed as data (never sourced/eval'd, nothing written in the guest), and re-validated: the cwd goes through the same path guard as an explicit `cwd`, execution-hijack variables (`LD_*`, `BASH_ENV`, `EDITOR`, `PAGER`, ...) are not carried, PATH-style variables must be absolute, sizes are capped. Not persisted: unexported shell variables, functions, aliases, `set` options, background jobs. A timed-out/killed command leaves the session unchanged; stop/start/destroy and server restarts reset sessions. `reset_shell_session` clears them; `shell_info` lists variable *names* only. Disable with `[shell.session] enabled = false`. The host target stays stateless.
 * **Host target** (`sandbox="host"`) is off unless `[host] enabled`, read-only unless `fs_write`, shell off unless `[host] shell`. The server's own config, state dir, audit log and code are never writable through it.
+* **Defaults** (`sbx/defaults.py`) only ever fill option-like arguments from a fixed list, validated when set and again by the tool that uses them; they never reach `path`, `command`, `overwrite`, `recursive`, `network`, `ports` or `mounts`, and they change nothing a call could not already do with an explicit argument. They are per MCP session, so one client cannot change what another receives.
 * **Audit log** (`[audit] log_file`): tamper-evident hash chain of every call; file contents and env values are never logged. One audit file per server process (the chain is per process).
 * HTTP transport requires a ≥16-char bearer token (or `--no-auth` on loopback). Runtime CLIs run with a scrubbed environment.
 
@@ -141,12 +201,12 @@ Things to know:
 image_list, image_pull, image_remove` · `list_allowed_directories, list_directory, directory_tree, file_info, read_file,
 read_multiple_files, view_image, search_files, grep` · `write_file, append_file, edit_file, create_directory, move_path,
 copy_path, delete_path, transfer_files` (write tools exist only with `[fs] read_only = false`; `delete_path` also needs
-`allow_delete`) · `run_command, check_command, shell_info, reset_shell_session`.
+`allow_delete`) · `run_command, check_command, shell_info, reset_shell_session` · `set_defaults, show_defaults`.
 
 ## Tests and what they do and do not prove
 
-`python -m pytest` (127 tests, plus one opt-in real-guest test): fs engine incl. traversal/symlink/tar attacks; agent protocol on a real Python subprocess;
-config validation; manager limits, ports, TTL, rollback; end-to-end over a real MCP stdio client including the human-approval flow.
+`python -m pytest` (200+ tests, plus one opt-in real-guest test): fs engine incl. traversal/symlink/tar attacks; agent protocol on a real Python subprocess;
+config validation; defaults (argument filling, output options, per-session isolation, and a guard that ties the tables to the registered tool schemas); manager limits, ports, TTL, rollback; end-to-end over a real MCP stdio client including the human-approval flow.
 Exercised against **real** binaries: `qemu-system-x86_64` (every flag we pass is accepted under seccomp, pidfile/QMP,
 forced stop, the "image has no guest agent" failure + cleanup), `qemu-img` (overlays, backing-chain refusal), `genisoimage` (seed ISO), the guest agent on Python 3.8/3.9/3.12.
 Folder mappings: validation, gating and the exact argv/config each backend emits are unit-tested; the QEMU path is also exercised with a

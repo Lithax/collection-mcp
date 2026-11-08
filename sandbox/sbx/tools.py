@@ -3,6 +3,8 @@
   * sandbox  - sandbox_* and image_* lifecycle tools
   * fs       - the fs_mcp tool set; every tool takes `sandbox` (a sandbox name, or "host")
   * shell    - run_command / check_command / shell_info; every tool takes `sandbox`
+  * defaults - set_defaults / show_defaults: say `sandbox`, `session`, ... and what results contain once
+               (see defaults.py; the server fills omitted arguments before a tool even runs)
 
 A tool call never reaches a runtime directly: it names a sandbox, the Hub resolves it to a registry
 record, and the Manager does the validated work. Errors that are safe to show are SbxError subclasses;
@@ -30,6 +32,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from . import defaults as dfl
 from . import shellcore as sc
 from .backends.base import ExecRequest
 from .config import Config
@@ -47,7 +50,11 @@ GUEST_SHELL = ('if command -v bash >/dev/null 2>&1; then exec bash --noprofile -
 
 SandboxArg = Annotated[str | None, Field(
     description="Which sandbox to act in (see sandbox_list). Use 'host' for the host machine if it is enabled. "
-                "Omit to use the server's default sandbox.")]
+                "Omit to use your default (see set_defaults) or the server's default sandbox.")]
+
+
+SandboxName = Annotated[str | None, Field(
+    description="Sandbox name. Omit to use your default (see set_defaults).")]
 
 
 def P(description: str):
@@ -91,9 +98,39 @@ class Hub:
         self.redact = sc.Redactor(g)
         self._rt: dict[str, ShellRuntime] = {}
         self.sessions = ses.SessionStore()
+        self.defaults = dfl.DefaultsStore(cfg.defaults.input, cfg.defaults.output, adopt_created=cfg.defaults.adopt_created)
         self._lock = threading.Lock()
         self.protected = [p for p in (cfg.config_path, cfg.audit.log_file, cfg.server.state_dir,
                                       os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) if p]
+
+    # -- defaults ---------------------------------------------------------------------
+    def out(self) -> dfl.Out:
+        """Output options in effect for the call being served."""
+        return self.defaults.current().out()
+
+    def dump(self, obj: Any) -> str:
+        """JSON for the model, pretty or compact as the session prefers."""
+        return json.dumps(obj, separators=(",", ":")) if self.out().json == "compact" else json.dumps(obj, indent=2)
+
+    def redump(self, text: str) -> str:
+        """Re-render JSON text produced elsewhere (the guest) according to the same preference."""
+        if self.out().json != "compact":
+            return text
+        try:
+            return json.dumps(json.loads(text), separators=(",", ":"))
+        except ValueError:
+            return text
+
+    def sandbox_name(self, name: str | None) -> str:
+        """The sandbox a lifecycle tool should act on: the argument (which the server already filled from the
+        caller's default if it was omitted) or the server-wide default. Never 'host': that is not a sandbox."""
+        name = name or self.cfg.tools.default_sandbox
+        if name == "host":
+            raise SbxError("the host is not a sandbox: this tool needs the name of a sandbox")
+        if not name:
+            raise SbxError("no sandbox specified: pass `name`, or set a default once with "
+                           "set_defaults(input={\"sandbox\": NAME}).")
+        return name
 
     # -- targets --------------------------------------------------------------------
     def target(self, name: str | None) -> Target:
@@ -101,7 +138,8 @@ class Hub:
         if not name:
             names = [r.name for r in self.mgr.reg.list()]
             raise SbxError("no sandbox specified and no default is configured. "
-                           + (f"Existing sandboxes: {', '.join(names)}." if names else
+                           + (f"Existing sandboxes: {', '.join(names)}. Pass `sandbox`, or set a default once with "
+                              "set_defaults(input={\"sandbox\": NAME})." if names else
                               "Create one with sandbox_create first."))
         if name == "host":
             if not self.cfg.host.enabled:
@@ -257,7 +295,7 @@ def register_sandbox_tools(mcp: FastMCP, hub: Hub) -> None:
         """Show which sandbox backends (docker, lxc, qemu) are enabled and working here, which network modes
         each supports, their limitations, and the configured resource ceilings."""
         lim = cfg.limits
-        return json.dumps({
+        return hub.dump({
             "backends": mgr.backends_info(),
             "defaults": {"backend": cfg.sandbox.backend, "network": cfg.sandbox.network, "cpus": cfg.sandbox.cpus,
                          "memory_mb": cfg.sandbox.memory_mb, "disk_mb": cfg.sandbox.disk_mb,
@@ -271,7 +309,7 @@ def register_sandbox_tools(mcp: FastMCP, hub: Hub) -> None:
             "requestable_folder_mappings": (
                 {n: {"guest": m["guest"], "mode": m["mode"]} for n, m in sorted(cfg.mounts.items())}
                 if lim.allow_mount_requests else "not enabled: the administrator attaches mappings to new sandboxes"),
-        }, indent=2)
+        })
 
     @tool(read_only=False)
     async def sandbox_create(
@@ -306,7 +344,10 @@ def register_sandbox_tools(mcp: FastMCP, hub: Hub) -> None:
                           + f"\n\nbackend={spec.backend} image={spec.image} network={spec.network}")
         rec = await anyio.to_thread.run_sync(mgr.create, name, overrides, start)
         hub.forget(rec.name)
-        return json.dumps(await anyio.to_thread.run_sync(mgr.describe, rec), indent=2)
+        d = await anyio.to_thread.run_sync(mgr.describe, rec)
+        if hub.defaults.adopt_created and hub.defaults.current().adopt(rec.name, server_default=cfg.tools.default_sandbox):
+            d["note"] = "now your default sandbox: omit `sandbox` to use it"
+        return hub.dump(d)
 
     @tool(read_only=True)
     def sandbox_list() -> str:
@@ -320,24 +361,26 @@ def register_sandbox_tools(mcp: FastMCP, hub: Hub) -> None:
             except SbxError as e:
                 d["runtime_state"] = f"unknown ({e})"
             rows.append(d)
-        return json.dumps(rows or "no sandboxes", indent=2)
+        return hub.dump(rows or "no sandboxes")
 
     @tool(read_only=True)
-    def sandbox_info(name: Annotated[str, Field(description="Sandbox name.")]) -> str:
+    def sandbox_info(name: SandboxName = None) -> str:
         """Detailed state of one sandbox: limits, network, ports, folder mappings (a 'rw' mapping is real
         files on the user's machine), IP, live resource usage."""
-        return json.dumps(mgr.describe(mgr.get(name)), indent=2)
+        return hub.dump(mgr.describe(mgr.get(hub.sandbox_name(name))))
 
     @tool(read_only=False)
-    def sandbox_start(name: Annotated[str, Field(description="Sandbox name.")]) -> str:
+    def sandbox_start(name: SandboxName = None) -> str:
         """Start a stopped sandbox (its files are kept)."""
+        name = hub.sandbox_name(name)
         rec = mgr.start(name)
         hub.sessions.reset(name)
-        return json.dumps(mgr.describe(rec), indent=2)
+        return hub.dump(mgr.describe(rec))
 
     @tool(read_only=False)
-    def sandbox_stop(name: Annotated[str, Field(description="Sandbox name.")]) -> str:
+    def sandbox_stop(name: SandboxName = None) -> str:
         """Stop a sandbox but keep its disk. Use sandbox_start to resume."""
+        name = hub.sandbox_name(name)
         mgr.stop(name)
         hub.sessions.reset(name)
         return f"stopped {name}"
@@ -347,12 +390,14 @@ def register_sandbox_tools(mcp: FastMCP, hub: Hub) -> None:
         """Destroy a sandbox and everything in it. This cannot be undone."""
         mgr.destroy(name)
         hub.forget(name)
+        hub.defaults.forget_sandbox(name)           # a default pointing at it would only produce errors now
         return f"destroyed {name}"
 
     @tool(read_only=False)
-    def sandbox_extend(name: Annotated[str, Field(description="Sandbox name.")],
-                       seconds: Annotated[int, Field(description="Make it live this many more seconds from now.", ge=1)]) -> str:
+    def sandbox_extend(seconds: Annotated[int, Field(description="Make it live this many more seconds from now.", ge=1)],
+                       name: SandboxName = None) -> str:
         """Extend a sandbox's time limit (never beyond the server's maximum lifetime)."""
+        name = hub.sandbox_name(name)
         rec = mgr.extend(name, seconds)
         return f"{name} now expires in {int(rec.expires_at - mgr.reg.now())}s"
 
@@ -404,7 +449,7 @@ def register_fs_tools(mcp: FastMCP, hub: Hub) -> None:
     @tool()
     def list_allowed_directories(sandbox: SandboxArg = None) -> str:
         """Show the directories file tools can access in a sandbox, its mode, and limits."""
-        return text("list_allowed_directories", sandbox)
+        return hub.redump(text("list_allowed_directories", sandbox))
 
     @tool()
     def list_directory(path: P("Directory path (relative paths resolve against the sandbox workdir).") = ".",
@@ -465,8 +510,9 @@ def register_fs_tools(mcp: FastMCP, hub: Hub) -> None:
              max_matches: Annotated[int, Field(description="Match cap.", ge=1)] = 100,
              sandbox: SandboxArg = None) -> str:
         """Search file contents (skips binaries, huge files and protected paths)."""
+        extra = {} if hub.out().stats else {"show_stats": False}      # only sent when it differs from the guest's default
         return text("grep", sandbox, pattern=pattern, path=path, file_glob=file_glob, regex=regex,
-                    case_sensitive=case_sensitive, max_matches=max_matches)
+                    case_sensitive=case_sensitive, max_matches=max_matches, **extra)
 
     @tool(write=True)
     def write_file(path: P("File path."), content: P("Full file contents (UTF-8)."),
@@ -488,8 +534,11 @@ def register_fs_tools(mcp: FastMCP, hub: Hub) -> None:
                   dry_run: Annotated[bool, Field(description="Show the diff without writing.")] = False,
                   sandbox: SandboxArg = None) -> str:
         """Targeted find-and-replace edits; returns a unified diff. Prefer this to rewriting whole files."""
-        return run("edit_file", sandbox, {"path": path, "edits": len(edits)}, path=path,
-                   edits=[e.model_dump() for e in edits], dry_run=dry_run)["text"]
+        res = run("edit_file", sandbox, {"path": path, "edits": len(edits)}, path=path,
+                  edits=[e.model_dump() for e in edits], dry_run=dry_run)
+        if hub.out().diff == "summary" and "added" in res:           # only a real edit carries counts; dry runs keep the diff
+            return f"edited {res['path']}: {len(edits)} edit(s), +{res['added']} -{res['removed']} lines"
+        return res["text"]
 
     @tool(write=True)
     def create_directory(path: P("Directory path."), sandbox: SandboxArg = None) -> str:
@@ -681,7 +730,8 @@ def register_shell_tools(mcp: FastMCP, hub: Hub) -> None:
                session=sess.name if sess else None,
                exit_code=res_exec.exit_code, signal=res_exec.signal, timed_out=res_exec.timed_out,
                truncated=res_exec.truncated)
-        out = sc.format_result(res_exec, timeout, c, hub.redact)
+        o = hub.out()
+        out = sc.format_result(res_exec, timeout, c, hub.redact, status=o.status, duration=o.duration, labels=o.labels)
         return out + ("\n" + note if note else "")
 
     @tool(read_only=False)
@@ -715,7 +765,7 @@ def register_shell_tools(mcp: FastMCP, hub: Hub) -> None:
         d["parsed_commands"] = ev.analysis.names
         audit.log({"tool": "check_command", "sandbox": tgt.name, "command": sc._short(command, 2000),
                    "outcome": ev.decision.action, "level": sc.LEVELS[ev.decision.level]})
-        return json.dumps(d, indent=2)
+        return hub.dump(d)
 
     @tool(read_only=True)
     def shell_info(sandbox: SandboxArg = None) -> str:
@@ -737,4 +787,39 @@ def register_shell_tools(mcp: FastMCP, hub: Hub) -> None:
                 {"name": x.name, "cwd": x.cwd or c.roots[0], "env_changed": sorted(x.env_set),
                  "env_unset": sorted(x.env_unset), "commands": x.runs}      # names only, never values
                 for x in hub.sessions.peek(tgt.name, tgt.rec.id)]}
-        return json.dumps(info, indent=2)
+        return hub.dump(info)
+
+
+# ------------------------------------------------------------------------- defaults tools
+
+def register_defaults_tools(mcp: FastMCP, hub: Hub) -> None:
+    """set_defaults / show_defaults. They only change this session's preferences held in server memory: they
+    touch no sandbox and no file, so they are annotated read-only (no confirmation prompts for them)."""
+    tool, audit = make_tool(mcp), hub.audit
+
+    def set_defaults(
+        input: Annotated[dict[str, Any] | None, Field(description="Argument defaults.")] = None,  # noqa: A002
+        output: Annotated[dict[str, Any] | None, Field(description="Result options.")] = None,
+        reset: Annotated[bool, Field(description="Clear what you set first.")] = False,
+    ) -> str:
+        sd = hub.defaults.current()
+        try:
+            sd.apply(input, output, reset=reset, host_enabled=hub.cfg.host.enabled)
+        except SbxError as e:
+            audit.log({"tool": "set_defaults", "ok": False, "error": str(e)[:300]})
+            raise
+        mine = sd.mine()
+        audit.log({"tool": "set_defaults", "ok": True, "reset": reset, **mine})       # the state after this call
+        msg = "ok " + json.dumps({k: v for k, v in mine.items() if v}, separators=(",", ":"))
+        name = mine["input"].get("sandbox")
+        if name and name != "host" and name not in {r.name for r in hub.mgr.reg.list()}:
+            msg += f"\nnote: no sandbox named {name!r} exists yet (create it with sandbox_create)"
+        return msg
+
+    set_defaults.__doc__ = dfl.tool_description()
+    tool(read_only=True)(set_defaults)
+
+    @tool(read_only=True)
+    def show_defaults() -> str:
+        """Show the defaults in effect for this session."""
+        return hub.dump(dfl.describe(hub.defaults.current()))

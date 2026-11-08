@@ -587,7 +587,7 @@ class FsCore:
         return ("\n".join(hits) if hits else "no matches") + footer
 
     def t_grep(self, pattern: str, path: str = ".", file_glob: str = "*", regex: bool = False,
-               case_sensitive: bool = False, max_matches: int = 100) -> str:
+               case_sensitive: bool = False, max_matches: int = 100, show_stats: bool = True) -> str:
         g, c = self.g, self.c
         if not pattern:
             raise FsError("pattern must not be empty")
@@ -642,6 +642,9 @@ class FsCore:
                 if reason:
                     break
             reason = reason or walk.reason
+        if not show_stats:
+            # Drop the routine counts; why a search ended early is still worth saying.
+            return "\n".join((out or ["no matches"]) + (["[stopped: %s]" % reason] if reason else []))
         summary = ("[%d matches; scanned %d files, skipped %d binary / %d large"
                    % (len(out), stats["files"], stats["binary"], stats["big"])
                    + ("; stopped: %s" % reason if reason else "") + "]")
@@ -725,6 +728,10 @@ class FsCore:
         diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True),
                                             "before", "after", n=2))
         lines = diff.splitlines()
+        # The first two lines of a non-empty unified diff are the ---/+++ file headers; count the rest
+        # before any truncation so the numbers stay exact even when the diff text is cut.
+        added = sum(1 for ln in lines[2:] if ln.startswith("+"))
+        removed = sum(1 for ln in lines[2:] if ln.startswith("-"))
         if len(lines) > 200:
             diff = "\n".join(lines[:200]) + "\n[diff truncated: %d more lines]" % (len(lines) - 200)
         if after == before:
@@ -735,7 +742,8 @@ class FsCore:
         if len(out) > c.max_write_bytes:
             raise FsError("result would exceed max_write_bytes")
         _atomic_write(t.path, out)
-        return diff
+        # a dict, so the host can show just the counts when the caller prefers a short result
+        return {"text": diff, "path": t.path, "added": added, "removed": removed}
 
     def t_create_directory(self, path: str) -> str:
         t = self.g.resolve(path, write=True)

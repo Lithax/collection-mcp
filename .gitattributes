@@ -1,0 +1,8 @@
+# Handle line endings automatically for all files detected as text
+# and force them to use LF on checkout and commit.
+* text=auto eol=lf
+
+# Explicitly declare binary files to protect them from corruption
+*.png binary
+*.jpg binary
+*.gif binary

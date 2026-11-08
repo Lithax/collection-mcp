@@ -13,11 +13,11 @@ import time
 
 from mcp.server.fastmcp import FastMCP
 
-from . import __version__, shellcore as sc
+from . import __version__, defaults as dfl, shellcore as sc
 from .config import SAMPLE_CONFIG, Config, add_cli_args, build_config, default_config_path, effective
 from .errors import ConfigError, SbxError
 from .manager import Manager
-from .tools import Hub, register_fs_tools, register_sandbox_tools, register_shell_tools
+from .tools import Hub, register_defaults_tools, register_fs_tools, register_sandbox_tools, register_shell_tools
 
 log = logging.getLogger("sandbox-mcp")
 
@@ -46,17 +46,56 @@ def instructions(cfg: Config) -> str:
         parts.append("Some sandboxes have folders of the user's machine mapped in (see `mounts` in sandbox_info). "
                      "A 'rw' mapping is the user's real files: edits and deletions there are not disposable.")
     if t.shell:
-        parts.append("Every run_command is a fresh, stateless shell: cd/export do not persist, so pass cwd. "
-                     "Commands are classified first; if one is refused the reason is returned, so adjust the "
+        if cfg.shell_guest.session_enabled:
+            parts.append("run_command keeps the working directory and exported environment between calls (per "
+                         "`session`), so cd once instead of passing cwd every time.")
+        else:
+            parts.append("Every run_command is a fresh, stateless shell: cd/export do not persist, so pass cwd.")
+        parts.append("Commands are classified first; if one is refused the reason is returned, so adjust the "
                      "approach rather than disguising the command. check_command dry-runs a command.")
+    parts.append("To stop repeating yourself, call set_defaults once: input={\"sandbox\": NAME} fills the `sandbox` "
+                 "argument (and other options) whenever you omit it; output={\"status\": false, \"json\": "
+                 "\"compact\"} trims what results contain. Arguments you pass explicitly always win; "
+                 "show_defaults lists what is in effect."
+                 + (" A sandbox you create becomes your default if you have none." if cfg.defaults.adopt_created else ""))
     return " ".join(parts)
+
+
+class SbxMCP(FastMCP):
+    """FastMCP that fills omitted arguments from the caller's session defaults.
+
+    This happens in call_tool, before argument validation, because only here is the raw dict the model sent
+    still available: afterwards "omitted" and "explicitly passed the default value" look the same, and tools
+    would need a sentinel on every parameter to tell them apart. Tool signatures stay untouched."""
+
+    def __init__(self, *args, store: dfl.DefaultsStore, **kwargs):
+        self._store = store
+        super().__init__(*args, **kwargs)
+
+    def _session_defaults(self) -> dfl.SessionDefaults:
+        try:
+            key = self.get_context().session          # the MCP session this request belongs to
+        except Exception:  # noqa: BLE001 - no request context (direct calls, tests): the shared fallback
+            key = None
+        return self._store.for_session(key)
+
+    async def call_tool(self, name, arguments):
+        sd = self._session_defaults()
+        args = dict(arguments or {})
+        tool = self._tool_manager.get_tool(name)
+        if tool is not None:
+            sd.fill(name, tool.parameters.get("properties", {}), args)
+        with dfl.activate(sd):                        # lets the tools see this session's output options
+            return await super().call_tool(name, args)
 
 
 def build_server(cfg: Config) -> tuple[FastMCP, Hub]:
     audit = sc.Audit(cfg.audit.log_file or None)
     mgr = Manager(cfg, audit)
     hub = Hub(cfg, mgr, audit)
-    mcp = FastMCP(cfg.server.name, instructions=instructions(cfg), host=cfg.server.host, port=cfg.server.port)
+    mcp = SbxMCP(cfg.server.name, instructions=instructions(cfg), host=cfg.server.host, port=cfg.server.port,
+                 store=hub.defaults)
+    register_defaults_tools(mcp, hub)
     if cfg.tools.sandbox:
         register_sandbox_tools(mcp, hub)
     if cfg.tools.fs:

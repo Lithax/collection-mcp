@@ -2942,25 +2942,39 @@ def _short(text: str, n: int = 1500) -> str:
     return text if len(text) <= n else text[:n] + f"... (+{len(text) - n} chars)"
 
 
-def format_result(r: ExecResult, timeout: float, cfg: Config, redact: Redactor) -> str:
-    if r.timed_out:
-        head = f"TIMED OUT after {timeout:g}s; the process group was killed"
-    elif r.flooded:
-        head = "KILLED: output far exceeded the output limit"
-    elif r.signal is not None:
-        head = f"terminated by signal {r.signal} ({signal.Signals(r.signal).name if r.signal in iter(signal.Signals) else '?'})"
-    else:
-        head = f"exit code: {r.exit_code}"
-    parts = [f"{head}  ({r.duration:.2f}s)"]
+def format_result(r: ExecResult, timeout: float, cfg: Config, redact: Redactor, *,
+                  status: bool = True, duration: bool = True, labels: bool = True) -> str:
+    """Render a finished command.
+
+    status    False hides the exit-code line unless something went wrong (non-zero exit, timeout, signal,
+              kill): a failure is never hidden, only the routine "exit code: 0".
+    duration  False drops the "(1.23s)" from that line.
+    labels    False drops the "--- stdout ---" marker when stdout is the only output. stderr keeps its marker
+              (and so does stdout when both are present) so the two can still be told apart.
+    The defaults reproduce the original format exactly.
+    """
+    abnormal = r.timed_out or r.flooded or r.signal is not None or r.exit_code != 0
+    parts: list[str] = []
+    if status or abnormal:
+        if r.timed_out:
+            head = f"TIMED OUT after {timeout:g}s; the process group was killed"
+        elif r.flooded:
+            head = "KILLED: output far exceeded the output limit"
+        elif r.signal is not None:
+            head = f"terminated by signal {r.signal} ({signal.Signals(r.signal).name if r.signal in iter(signal.Signals) else '?'})"
+        else:
+            head = f"exit code: {r.exit_code}"
+        parts.append(f"{head}  ({r.duration:.2f}s)" if duration else head)
     if r.stdout:
-        parts.append("--- stdout ---\n" + redact.clean(r.stdout).rstrip("\n"))
+        body = redact.clean(r.stdout).rstrip("\n")
+        parts.append(body if (not labels and not r.stderr) else "--- stdout ---\n" + body)
     if r.stderr:
         parts.append("--- stderr ---\n" + redact.clean(r.stderr).rstrip("\n"))
     if not r.stdout and not r.stderr:
         parts.append("(no output)")
     if r.truncated:
         parts.append(f"[output truncated at {cfg.max_output_bytes} bytes per stream]")
-    return "\n".join(parts)
+    return "\n".join(parts) or "(no output)"        # e.g. status hidden and the command printed only a newline
 
 
 def warn_secrets_in_roots(cfg: Config, guard: PathGuard) -> None:

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import __version__, shellcore
+from . import defaults as defaultslib
 from . import mounts as mountslib
 from .errors import ConfigError
 
@@ -44,6 +45,15 @@ class ToolsCfg:
     fs: bool = True                         # filesystem tools
     shell: bool = True                      # run_command / check_command
     default_sandbox: str = ""               # used when a tool call omits `sandbox`
+
+
+@dataclass
+class DefaultsCfg:
+    """Defaults the model would otherwise have to repeat on every call (see sbx/defaults.py).
+    The model can change its own at any time with the set_defaults tool; these are where each session starts."""
+    input: dict[str, Any] = field(default_factory=dict)    # e.g. { session = "dev", timeout_seconds = 120 }
+    output: dict[str, Any] = field(default_factory=dict)   # e.g. { status = false, json = "compact" }
+    adopt_created: bool = False             # a sandbox the model creates becomes its default if it has none yet
 
 
 @dataclass
@@ -193,6 +203,7 @@ class AuditCfg:
 class Config:
     server: ServerCfg = field(default_factory=ServerCfg)
     tools: ToolsCfg = field(default_factory=ToolsCfg)
+    defaults: DefaultsCfg = field(default_factory=DefaultsCfg)
     sandbox: SandboxDefaults = field(default_factory=SandboxDefaults)
     limits: LimitsCfg = field(default_factory=LimitsCfg)
     docker: DockerCfg = field(default_factory=DockerCfg)
@@ -420,6 +431,11 @@ def finalize(cfg: Config) -> Config:
             validate_name(cfg.tools.default_sandbox)
         except Exception:
             raise ConfigError("[tools] default_sandbox must be 'host' or a valid sandbox name") from None
+    try:
+        cfg.defaults.input, cfg.defaults.output = defaultslib.validate_admin(
+            cfg.defaults.input, cfg.defaults.output, host_enabled=cfg.host.enabled)
+    except defaultslib.DefaultsError as e:
+        raise ConfigError(str(e)) from None
 
     if cfg.audit.log_file:
         cfg.audit.log_file = os.path.realpath(os.path.expanduser(cfg.audit.log_file))
@@ -633,6 +649,25 @@ sandbox = true                      # sandbox_create / list / start / stop / des
 fs = true                           # read_file, write_file, ... each takes `sandbox = "<name>"`
 shell = true                        # run_command / check_command, each takes `sandbox = "<name>"`
 default_sandbox = ""                # used when a call omits `sandbox` ("host" is allowed if [host] is on)
+
+# ---------------------------------------------------------------------------------------------
+# Defaults the model would otherwise repeat on every call. It can change its own at any time with the
+# set_defaults tool; these are where every session starts. An argument it passes explicitly always wins.
+#   input  = arguments filled in when omitted: session, timeout_seconds, details, max_depth, max_lines,
+#            max_results, max_matches, regex, case_sensitive, dry_run  (the default *sandbox* is [tools] above)
+#   output = what results contain: status, duration, labels (run_command), diff (edit_file),
+#            stats (grep), json (pretty|compact)
+# Failures are never hidden: status = false only drops the routine "exit code: 0" line.
+[defaults]
+adopt_created = false               # true: a sandbox the model creates becomes its default if it has none yet
+# [defaults.input]
+# session = "dev"
+# timeout_seconds = 120
+# [defaults.output]
+# status = false
+# duration = false
+# labels = false
+# json = "compact"
 
 # ---------------------------------------------------------------------------------------------
 # Defaults for NEW sandboxes. The model may override cpus/memory/... in sandbox_create, but never
