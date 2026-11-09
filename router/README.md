@@ -8,7 +8,17 @@ server listed in `servers.json`.
     python router.py                      # http://127.0.0.1:8000/mcp
     ROUTER_TRANSPORT=stdio python router.py   # for local stdio clients
 
-Env vars: `ROUTER_CONFIG`, `ROUTER_HOST`, `ROUTER_PORT`, `ROUTER_TIMEOUT` (60s), `ROUTER_MAX_CHARS` (20000).
+Env vars: `ROUTER_CONFIG`, `ROUTER_HOST`, `ROUTER_PORT`, and these limits (defaults in brackets):
+
+| variable | meaning |
+|---|---|
+| `ROUTER_TIMEOUT` (60) | seconds to wait for one upstream call; a call that passes `timeout_seconds` waits longer (see Timeouts) |
+| `ROUTER_MAX_TIMEOUT` (900) | ceiling for the above |
+| `ROUTER_KEEPALIVE` (15) | seconds between progress pings while a call is slow, 0 = off |
+| `ROUTER_MAX_CHARS` (20000) | text per result; the rest is cut |
+| `ROUTER_MAX_IMAGE_CHARS` (7000000) | base64 characters per image/audio block (about 5 MB); bigger ones become a text note |
+| `ROUTER_SESSION_IDLE` (14400) | seconds of silence after which a chat's upstream session is closed |
+| `ROUTER_MAX_SESSIONS` (16) | chat sessions kept open per server (least recently used closed first) |
 
 ## Add servers from the command line
 Point the CLI at something that's already running; it works out the rest.
@@ -36,7 +46,7 @@ interactive hidden prompt or an already-exported variable
 that lands in your shell history. Servers that only support OAuth (no static token) aren't
 supported yet.
 
-To try it: `python examples/demo_upstream.py http 9000` in one terminal, then
+To try it: `python demo_upstream.py http 9000` in one terminal, then
 `python router.py add 127.0.0.1:9000` in another.
 
 ## Tools
@@ -45,8 +55,8 @@ To try it: `python examples/demo_upstream.py http 9000` in one terminal, then
 | `list_servers` | configured upstreams |
 | `list_tools(server)` | names + one-line descriptions |
 | `describe_tool(server, tool)` | full JSON schema |
-| `call_tool(server, tool, arguments)` | run it |
-| `restart_server(server)` | drop cached connection / kill stdio process |
+| `call_tool(server, tool, arguments)` | run it (text and images come back) |
+| `restart_server(server)` | drop every cached connection to it / kill a stdio process |
 | `forward(server, tools, enable)` | expose upstream tools directly as router tools (see below) |
 
 ## Forwarding: call upstream tools directly
@@ -76,12 +86,51 @@ restart); tools set by `expose` can't be switched off with `forward`, edit `serv
 **Client support:** the router sends `tools/list_changed` after `forward()` changes anything, but
 whether a client picks that up mid-conversation is up to the client. If the new tools don't show up,
 reconnect the connector, or use static `expose`, which works with any client. Forwarded tools use
-the upstream's description and input schema; upstream output schemas are not forwarded (results
-come back as text, like `call_tool`). Tested with fastmcp 4.1.x.
+the upstream's description and input schema; upstream output schemas are not forwarded. Results come
+back as content blocks, like `call_tool`: text (capped at `ROUTER_MAX_CHARS`) and images/audio
+untouched. Tested with fastmcp 4.1.x.
 
 Tests: `python -m pytest tests -q` (in-memory, uses `demo_upstream.py`), and
 `python tests/smoke_http.py` (starts the real router over HTTP). The `CancelledError`
 traceback the router prints on SIGTERM is not from forwarding; the original code does it too.
+
+## Sessions: one upstream session per chat
+Some servers keep state per MCP session (the sandbox's `set_defaults` does). If every chat shared
+one upstream session, one chat's defaults would leak into the next. So for a server reached by URL
+the router opens a separate upstream session for each downstream client (chat), and closes it after
+`ROUTER_SESSION_IDLE` seconds of silence, or when more than `ROUTER_MAX_SESSIONS` are open (least
+recently used first). In `servers.json`:
+
+    "sandbox": { "url": "http://127.0.0.1:8767/mcp", "sessions": "auto" }   // auto | per_client | shared
+
+`auto` (the default) and `per_client` isolate chats; `shared` restores the old behavior, one session
+for everybody. stdio servers are always shared, since another connection would mean another
+process. `list_servers` shows each server's mode.
+
+This needs a client the router can recognize from one request to the next: a stateful connection
+(initialize handshake). Over the newer stateless protocol (MCP 2026-07-28) an anonymous HTTP request
+carries no identity, so those calls fall back to one shared session and nothing can be isolated.
+A server entry can also set `"mode": "legacy"` to make the router itself use the classic handshake
+toward that server, which is what servers with per-session state want.
+
+## Images and audio
+Results from an upstream tool pass through as MCP content blocks: text (capped, see above), images
+and audio untouched, so tools like the sandbox's `view_image` work. A block bigger than
+`ROUTER_MAX_IMAGE_CHARS` is replaced by a short text note. Resources and resource links are shown as text.
+
+## Questions from upstream (approvals)
+An upstream server can ask its client a question in the middle of a call (MCP elicitation; the
+sandbox does this to ask "allow network access?" or "run this risky command?"). The router passes
+such a question to the client that made the call, and the answer back, if that client declared
+elicitation support and can be asked back. Otherwise the upstream sees "elicitation unsupported"
+and refuses, as before. The call waits while the question is open, so answer within its timeout.
+
+## Timeouts
+The router waits `ROUTER_TIMEOUT` seconds (60) for an upstream call. A call that passes
+`timeout_seconds` (like the sandbox's `run_command`) is waited for that long plus ten seconds, up to
+`ROUTER_MAX_TIMEOUT` (900). While a call is slow the router sends the client a progress notification
+every `ROUTER_KEEPALIVE` seconds (15), if the client asked for progress; that keeps proxies and clients
+with idle timeouts from giving up. Your client or tunnel may still have a limit of its own.
 
 ## Notes
 - Entries can set `"transport": "sse"` for legacy SSE servers (the CLI does this for you).

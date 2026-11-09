@@ -22,6 +22,12 @@ the config keys and the security rules; `python router.py check NAME` shows what
 
 servers.json is re-read on every call, so you can add/edit/remove upstream
 servers while this is running (hot swap) without restarting anything.
+
+Each downstream client (chat) gets its own upstream session for servers reached by URL, so state
+a server keeps per session (the sandbox's set_defaults) isn't shared between chats; see "sessions"
+in README.md. Images and audio from upstream tools pass through, a call's own timeout_seconds is
+honoured, and questions an upstream asks its client (MCP elicitation, e.g. "allow network access?")
+are relayed to ours when it can answer.
 """
 
 from __future__ import annotations
@@ -32,6 +38,8 @@ import json
 import os
 import signal
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -51,8 +59,14 @@ except ImportError:  # pragma: no cover
 from router_launch import Launch, LaunchError, Supervisor, resolve_launch  # noqa: F401  (resolve_launch used by the CLI)
 
 CONFIG_PATH = Path(os.environ.get("ROUTER_CONFIG", Path(__file__).with_name("servers.json")))
-CALL_TIMEOUT = float(os.environ.get("ROUTER_TIMEOUT", "60"))
-MAX_CHARS = int(os.environ.get("ROUTER_MAX_CHARS", "20000"))
+CALL_TIMEOUT = float(os.environ.get("ROUTER_TIMEOUT", "60"))  # how long to wait for one upstream call
+MAX_CALL_TIMEOUT = float(os.environ.get("ROUTER_MAX_TIMEOUT", "900"))  # ceiling for calls that ask for longer
+TIMEOUT_GRACE = 10.0  # seconds added on top of a call's own timeout_seconds
+KEEPALIVE = float(os.environ.get("ROUTER_KEEPALIVE", "15"))  # progress ping while waiting on upstream (0 = off)
+MAX_CHARS = int(os.environ.get("ROUTER_MAX_CHARS", "20000"))  # text per result
+MAX_IMAGE_CHARS = int(os.environ.get("ROUTER_MAX_IMAGE_CHARS", "7000000"))  # base64 chars per image/audio (~5 MB)
+SESSION_IDLE = float(os.environ.get("ROUTER_SESSION_IDLE", "14400"))  # close per-client sessions idle this long
+MAX_SESSIONS = int(os.environ.get("ROUTER_MAX_SESSIONS", "16"))  # per-client sessions kept per server
 
 
 def log(*a: Any) -> None:
@@ -131,13 +145,93 @@ def _blocked(cfg: dict[str, Any], tool: str) -> str | None:
 # --------------------------------------------------------------------------
 # Connection pool: lazy, cached, auto-reconnect, invalidated on config change
 # --------------------------------------------------------------------------
+# A server reached by URL (HTTP/SSE) gets one upstream session PER DOWNSTREAM CLIENT (chat). Servers
+# like the sandbox keep state per session (set_defaults), and one session shared by every chat would
+# leak that state from one chat into another. Everything else (stdio servers, where another
+# connection would mean another process) keeps one shared connection.
+#   servers.json:  "sessions": "auto" (default) | "per_client" | "shared"
+# The downstream client is identified by fastmcp's own session scope. When nothing identifies it from
+# one request to the next (the stateless protocol era over HTTP) its calls share one session.
+_ALL = object()
+
+
+def _isolates(cfg: dict[str, Any]) -> bool:
+    """Does this server get one upstream session per downstream client?"""
+    return "url" in cfg and cfg.get("sessions", "auto") != "shared"
+
+
+def _request_ctx() -> Any:
+    """The MCP context of the downstream request being served, or None outside a request."""
+    try:
+        return get_context()
+    except RuntimeError:
+        return None
+
+
+def _client_scope(ctx: Any) -> str | None:
+    """A stable id for the downstream client behind ctx, or None when nothing identifies it from one
+    request to the next."""
+    if ctx is None:
+        return None
+    try:
+        scope = getattr(ctx, "_session_scope_key", None)  # fastmcp >= 4 knows about the stateless era
+        return scope() if callable(scope) else ctx.session_id
+    except Exception:  # noqa: BLE001 - no session yet
+        return None
+
+
+def _can_elicit(ctx: Any) -> bool:
+    """Can the downstream client behind ctx be asked a question (MCP elicitation) right now?"""
+    if ctx is None:
+        return False
+    try:
+        session = ctx.session
+        if getattr(session, "can_send_request", True) is False:  # no back-channel (stateless era)
+            return False
+        caps = getattr(session, "client_capabilities", None)
+        if caps is None:
+            caps = getattr(getattr(session, "client_params", None), "capabilities", None)
+        return getattr(caps, "elicitation", None) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class _Entry:
+    """One upstream connection and what the router needs to know about it."""
+
+    def __init__(self, fingerprint: str, scope: str | None) -> None:
+        self.fingerprint = fingerprint
+        self.scope = scope  # the downstream client it belongs to; None = shared
+        self.client: Client | None = None
+        self.last_used = time.monotonic()
+        self.active: list[Any] = []  # downstream requests currently waiting on this connection
+
+    async def relay_elicitation(self, message: str, response_type: Any, params: Any, context: Any) -> Any:
+        """The upstream server asked its client a question (e.g. 'allow network access?'). Ask ours."""
+        ctx = self.active[-1] if self.active else None
+        if ctx is None or not _can_elicit(ctx):
+            raise RuntimeError("the client behind this call can't be asked questions (no elicitation support)")
+        session = ctx.session
+        if getattr(params, "mode", "form") == "url":
+            return await session.elicit_url(
+                params.message, params.url, params.elicitation_id or uuid.uuid4().hex, ctx.request_id
+            )
+        ask = getattr(session, "elicit_form", None) or session.elicit
+        return await ask(params.message, params.requested_schema, ctx.request_id)
+
+
 class Pool:
     def __init__(self) -> None:
-        self._clients: dict[str, tuple[str, Client]] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._clients: dict[tuple[str, str | None], _Entry] = {}
+        self._locks: dict[tuple[str, str | None], asyncio.Lock] = {}
 
-    def _lock(self, name: str) -> asyncio.Lock:
-        return self._locks.setdefault(name, asyncio.Lock())
+    def _lock(self, key: tuple[str, str | None]) -> asyncio.Lock:
+        return self._locks.setdefault(key, asyncio.Lock())
+
+    def _forget_lock(self, key: tuple[str, str | None]) -> None:
+        lock = self._locks.get(key)
+        if lock is not None and not lock.locked():
+            del self._locks[key]
 
     @staticmethod
     def _config_for(name: str) -> dict[str, Any]:
@@ -149,34 +243,76 @@ class Pool:
             raise ValueError(f"server '{name}' is disabled in servers.json")
         return cfg
 
-    async def get(self, name: str) -> tuple[Client, dict[str, Any]]:
+    async def get(self, name: str, scope: str | None = None, ctx: Any = None) -> tuple[_Entry, dict[str, Any]]:
+        """The upstream connection for `name` (and downstream client `scope`), connecting if needed."""
         cfg = self._config_for(name)
         fingerprint = json.dumps(cfg, sort_keys=True)
-        async with self._lock(name):
-            cur = self._clients.get(name)
-            if cur and cur[0] == fingerprint and cur[1].is_connected():
-                return cur[1], cfg
+        if not _isolates(cfg):
+            scope = None
+        key = (name, scope)
+        async with self._lock(key):
+            cur = self._clients.get(key)
+            if cur and cur.fingerprint == fingerprint and cur.client.is_connected():
+                cur.last_used = time.monotonic()
+                return cur, cfg
             if cur:  # config changed or connection died
-                await self._close(cur[1])
-                self._clients.pop(name, None)
+                await self._close(cur.client)
+                self._clients.pop(key, None)
             # Managed servers: start the process first (no-op for plain configs)
             launch = await supervisor.prepare(name, cfg)
-            client = Client(make_transport(cfg, launch), timeout=CALL_TIMEOUT)
+            entry = _Entry(fingerprint, scope)
+            extra: dict[str, Any] = {}
+            if cfg.get("mode"):
+                extra["mode"] = cfg["mode"]  # "legacy" forces the classic initialize handshake
+            if _can_elicit(ctx):  # only then can the upstream's questions be passed on
+                extra["elicitation_handler"] = entry.relay_elicitation
+            client = Client(make_transport(cfg, launch), timeout=CALL_TIMEOUT, **extra)
             await asyncio.wait_for(client.__aenter__(), timeout=CALL_TIMEOUT)
-            self._clients[name] = (fingerprint, client)
-            log(f"connected to '{name}'")
-            return client, cfg
+            entry.client = client
+            self._clients[key] = entry
+            log(f"connected to '{name}'" + (f" (own session for client {scope[:8]})" if scope else ""))
+        await self._evict(name, keep=key)
+        return entry, cfg
 
-    async def drop(self, name: str) -> bool:
-        async with self._lock(name):
-            cur = self._clients.pop(name, None)
+    async def drop(self, name: str, scope: Any = _ALL) -> bool:
+        """Close the upstream connections of `name`: all of them, or only the one for `scope`."""
+        dropped = False
+        for key in [k for k in list(self._clients) if k[0] == name and (scope is _ALL or k[1] == scope)]:
+            async with self._lock(key):
+                cur = self._clients.pop(key, None)
+                if cur:
+                    await self._close(cur.client)
+                    dropped = True
+            self._forget_lock(key)
+        return dropped
+
+    def connected(self, name: str) -> bool:
+        return any(k[0] == name for k in self._clients)
+
+    def names(self) -> set[str]:
+        return {k[0] for k in self._clients}
+
+    async def _evict(self, name: str, keep: tuple[str, str | None]) -> None:
+        """Close per-client sessions of `name` that went idle, and the least recently used ones beyond
+        MAX_SESSIONS, so chats that came and went don't pile up. Shared connections and sessions with
+        a call in flight are never touched."""
+        scoped = [(k, e) for k, e in self._clients.items() if k[0] == name and k[1] is not None]
+        free = [(k, e) for k, e in scoped if k != keep and not e.active]
+        now = time.monotonic()
+        victims = [k for k, e in free if SESSION_IDLE > 0 and now - e.last_used > SESSION_IDLE]
+        over = len(scoped) - len(victims) - MAX_SESSIONS if MAX_SESSIONS > 0 else 0
+        if over > 0:
+            rest = sorted((e.last_used, k) for k, e in free if k not in victims)
+            victims += [k for _, k in rest[:over]]
+        for key in victims:
+            cur = self._clients.pop(key, None)
             if cur:
-                await self._close(cur[1])
-                return True
-            return False
+                log(f"closing an idle session on '{name}'")
+                await self._close(cur.client)
+            self._forget_lock(key)
 
     async def shutdown(self) -> None:
-        await asyncio.gather(*(self.drop(n) for n in list(self._clients)), return_exceptions=True)
+        await asyncio.gather(*(self.drop(n) for n in self.names()), return_exceptions=True)
 
     @staticmethod
     async def _close(client: Client) -> None:
@@ -201,22 +337,32 @@ supervisor = Supervisor(CONFIG_PATH, log)
 async def _prune() -> None:
     """Drop connections/processes for servers removed or disabled in servers.json."""
     enabled = {n for n, c in load_config().items() if not c.get("disabled")}
-    for name in [n for n in pool._clients if n not in enabled]:
+    for name in [n for n in pool.names() if n not in enabled]:
         await pool.drop(name)
     await supervisor.prune(enabled)
 
 
-async def with_client(name: str, fn):
-    """Run fn(client, cfg); on a connection-level failure, reconnect once."""
+async def with_client(name: str, fn, *, shared: bool = False):
+    """Run fn(client, cfg); on a connection-level failure, reconnect once.
+
+    On behalf of a downstream client the call goes over that client's own upstream session (see the
+    pool above). shared=True is for the router's own housekeeping, e.g. listing tools to forward."""
+    ctx = None if shared else _request_ctx()
+    scope = _client_scope(ctx)
     for attempt in (1, 2):
-        client, cfg = await pool.get(name)
+        entry, cfg = await pool.get(name, scope, ctx)
+        if ctx is not None:
+            entry.active.append(ctx)
         try:
-            return await fn(client, cfg)
+            return await fn(entry.client, cfg)
         except (ConnectionError, OSError, asyncio.TimeoutError, RuntimeError) as e:
             if attempt == 2:
                 raise
             log(f"'{name}' failed ({e!r}); reconnecting")
-            await pool.drop(name)
+            await pool.drop(name, entry.scope)
+        finally:
+            if ctx is not None and ctx in entry.active:
+                entry.active.remove(ctx)
 
 
 # --------------------------------------------------------------------------
@@ -247,29 +393,133 @@ def _first_line(text: str | None, limit: int = 160) -> str:
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
-def _flatten(result: Any) -> str:
+def _mime(block: Any) -> str:
+    return getattr(block, "mime_type", None) or getattr(block, "mimeType", None) or "?"
+
+
+def _blocks(result: Any) -> list[Any]:
+    """An upstream tool result as content blocks for our client.
+
+    Text is joined and capped at MAX_CHARS in total. Images and audio pass through untouched, in
+    order, so a tool like view_image works, unless one is absurdly large (MAX_IMAGE_CHARS).
+    Embedded resources and links become text."""
+    out: list[Any] = []
     parts: list[str] = []
+    budget = MAX_CHARS
+    dropped = 0
+
+    def flush() -> None:
+        nonlocal budget, dropped
+        if not parts:
+            return
+        text = "\n".join(parts)
+        parts.clear()
+        if budget <= 0:
+            dropped += len(text)
+            return
+        if len(text) > budget:
+            dropped += len(text) - budget
+            text = text[:budget]
+        budget -= len(text)
+        out.append(mcp_types.TextContent(type="text", text=text))
+
     for block in getattr(result, "content", None) or []:
         kind = getattr(block, "type", "")
         if kind == "text":
             parts.append(block.text)
         elif kind in ("image", "audio"):
             size = len(getattr(block, "data", "") or "")
-            parts.append(f"[{kind}: {getattr(block, 'mimeType', '?')}, ~{size} base64 chars omitted]")
+            if size > MAX_IMAGE_CHARS:
+                parts.append(f"[{kind}: {_mime(block)}, ~{size} base64 chars, over ROUTER_MAX_IMAGE_CHARS, omitted]")
+            else:
+                flush()
+                out.append(block)
         elif kind == "resource":
             res = getattr(block, "resource", None)
             text = getattr(res, "text", None)
             parts.append(text if text is not None else f"[resource: {getattr(res, 'uri', '?')}]")
+        elif kind == "resource_link":
+            parts.append(f"[resource link: {getattr(block, 'uri', '?')}]")
         else:
             parts.append(str(block))
-    if not parts and getattr(result, "structured_content", None) is not None:
+    if not parts and not out and getattr(result, "structured_content", None) is not None:
         parts.append(json.dumps(result.structured_content, indent=2, default=str))
-    text = "\n".join(parts) if parts else "(no output)"
-    if len(text) > MAX_CHARS:
-        text = text[:MAX_CHARS] + f"\n…[truncated, {len(text) - MAX_CHARS} more chars]"
-    return text
+    flush()
+    if dropped:
+        note = f"\n…[truncated, {dropped} more chars]"
+        for i in range(len(out) - 1, -1, -1):
+            if getattr(out[i], "type", "") == "text":
+                out[i] = mcp_types.TextContent(type="text", text=out[i].text + note)
+                break
+        else:
+            out.append(mcp_types.TextContent(type="text", text=note.lstrip()))
+    return out or [mcp_types.TextContent(type="text", text="(no output)")]
 
 
+def _with_prefix(blocks: list[Any], prefix: str) -> list[Any]:
+    """Put a line of text in front of the first text block (or in front of everything)."""
+    if blocks and getattr(blocks[0], "type", "") == "text":
+        return [mcp_types.TextContent(type="text", text=f"{prefix}\n{blocks[0].text}"), *blocks[1:]]
+    return [mcp_types.TextContent(type="text", text=prefix), *blocks]
+
+
+# --------------------------------------------------------------------------
+# Calling upstream: per-call timeout, keepalive
+# --------------------------------------------------------------------------
+def _call_timeout(arguments: dict[str, Any] | None) -> float:
+    """How long to wait for one upstream call: ROUTER_TIMEOUT, or longer when the call itself says it
+    needs it (timeout_seconds, as the sandbox's run_command has), up to ROUTER_MAX_TIMEOUT."""
+    want = (arguments or {}).get("timeout_seconds")
+    if isinstance(want, (int, float)) and not isinstance(want, bool) and want > 0:
+        return max(CALL_TIMEOUT, min(float(want) + TIMEOUT_GRACE, MAX_CALL_TIMEOUT))
+    return CALL_TIMEOUT
+
+
+def _is_timeout(e: BaseException) -> bool:
+    code = getattr(e, "code", None) or getattr(getattr(e, "error", None), "code", None)
+    return isinstance(e, TimeoutError) or code == 408 or "timed out" in str(e).lower()
+
+
+async def _keepalive(ctx: Any, call: Any) -> Any:
+    """Await `call`. While it runs, tell the downstream client every ROUTER_KEEPALIVE seconds that we
+    are still waiting (a progress notification, sent only if the client asked for progress), so
+    proxies and clients with idle timeouts don't give up on a slow call."""
+    if ctx is None or KEEPALIVE <= 0:
+        return await call
+
+    async def ping() -> None:
+        n = 0
+        while True:
+            await asyncio.sleep(KEEPALIVE)
+            n += 1
+            try:
+                await ctx.report_progress(progress=n, message="waiting for the upstream server")
+            except Exception:  # noqa: BLE001 - a failed ping must never fail the call
+                return
+
+    task = asyncio.create_task(ping())
+    try:
+        return await call
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _call_upstream(client: Client, tool: str, arguments: dict[str, Any] | None):
+    """client.call_tool with the right timeout and keepalive; errors come back as results."""
+    timeout = _call_timeout(arguments)
+    try:
+        return await _keepalive(
+            _request_ctx(), client.call_tool(tool, arguments or {}, timeout=timeout, raise_on_error=False)
+        )
+    except Exception as e:  # noqa: BLE001
+        if _is_timeout(e):
+            raise ToolError(
+                f"'{tool}' gave no answer within {timeout:.0f}s; it may still be running upstream. For a slow "
+                f"call pass a bigger timeout_seconds (the router then waits that long, up to {MAX_CALL_TIMEOUT:.0f}s) "
+                "or raise ROUTER_TIMEOUT."
+            ) from None
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -301,10 +551,10 @@ class ForwardedTool(Tool):
         async def go(client: Client, cfg: dict[str, Any]):
             if (why := _blocked(cfg, tool)):
                 raise ToolError(why)
-            return await client.call_tool(tool, arguments or {}, raise_on_error=False)
+            return await _call_upstream(client, tool, arguments)
 
         result = await with_client(server, go)
-        return ToolResult(content=_flatten(result), is_error=bool(getattr(result, "is_error", False)))
+        return ToolResult(content=_blocks(result), is_error=bool(getattr(result, "is_error", False)))
 
 
 # exposed name -> (server, upstream tool name, fingerprint of description+schema)
@@ -352,7 +602,7 @@ async def _sync_forwarded() -> list[str]:
                 return await _all_tools(client)
 
             try:
-                tools = await with_client(server, lister)
+                tools = await with_client(server, lister, shared=True)
             except Exception as e:  # noqa: BLE001
                 log(f"expose '{server}': can't list tools ({e!r}); keeping what was forwarded before")
                 unreachable.add(server)
@@ -461,7 +711,8 @@ async def list_servers() -> list[dict[str, Any]]:
             "transport": (cfg.get("transport", "http") if "url" in cfg else "stdio"),
             "description": cfg.get("description", ""),
             "disabled": bool(cfg.get("disabled")),
-            "connected": name in pool._clients,
+            "connected": pool.connected(name),
+            "sessions": "per_client" if _isolates(cfg) else "shared",
         }
         if "path" in cfg:
             item["managed"] = supervisor.status(name)
@@ -505,16 +756,18 @@ async def describe_tool(server: str, tool: str) -> dict[str, Any]:
 
 
 @mcp.tool
-async def call_tool(server: str, tool: str, arguments: dict[str, Any] | None = None) -> str:
+async def call_tool(server: str, tool: str, arguments: dict[str, Any] | None = None) -> ToolResult:
     """Call a tool on an upstream server. `arguments` must match the schema
-    from describe_tool. Returns the tool's text output (truncated if huge)."""
+    from describe_tool. Returns the tool's output: text (truncated if huge) and any images."""
 
     async def run(client: Client, cfg: dict[str, Any]):
         if (why := _blocked(cfg, tool)):
             raise ValueError(why)
-        result = await client.call_tool(tool, arguments or {}, raise_on_error=False)
-        text = _flatten(result)
-        return f"[error from {server}.{tool}]\n{text}" if getattr(result, "is_error", False) else text
+        result = await _call_upstream(client, tool, arguments)
+        blocks = _blocks(result)
+        if getattr(result, "is_error", False):
+            blocks = _with_prefix(blocks, f"[error from {server}.{tool}]")
+        return ToolResult(content=blocks)
 
     return await with_client(server, run)
 
