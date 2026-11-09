@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A tiny fake `docker` CLI for tests. State lives in $FAKE_DOCKER_DIR. `exec` runs the command locally."""
-import json, os, sys
+import json, os, shutil, sys
 
 D = os.environ["FAKE_DOCKER_DIR"]
 os.makedirs(D, exist_ok=True)
@@ -55,6 +55,17 @@ elif cmd == "exec":
     env = dict(os.environ)
     for e in c["env"]:
         k, _, v = e.partition("="); env[k] = v
+    if c["args"][c["args"].index("--entrypoint") + 2].startswith("nopython"):
+        # an image without python: a PATH of links to everything on the real PATH except python*
+        bindir = os.path.join(D, "nopython-bin")
+        if not os.path.isdir(bindir):
+            os.makedirs(bindir, exist_ok=True)
+            for d in (env.get("PATH") or "/usr/local/bin:/usr/bin:/bin").split(":"):
+                for f in (os.listdir(d) if os.path.isdir(d) else []):
+                    if not f.startswith("python"):
+                        try: os.symlink(os.path.join(d, f), os.path.join(bindir, f))
+                        except OSError: pass
+        env["PATH"] = bindir
     os.execvpe(argv[0], argv, env)
 elif cmd == "pull":
     if a[1].startswith("missing"):

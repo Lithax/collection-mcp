@@ -61,7 +61,7 @@ class SandboxDefaults:
     """Defaults for new sandboxes. A profile ([profiles.NAME]) or the create call can override any of these."""
     backend: str = "docker"
     image: str = ""                         # "" = use the per-backend image below
-    image_docker: str = "debian:12-slim"
+    image_docker: str = "python:3.12-slim"   # needs python3: the file tools run on it
     image_lxc: str = "debian/bookworm/amd64"
     image_qemu: str = "debian-12"
     cpus: float = 1.0
@@ -675,7 +675,7 @@ adopt_created = false               # true: a sandbox the model creates becomes 
 [sandbox]
 backend = "docker"                  # docker | lxc | qemu
 image = ""                          # "" = the per-backend image below; or set one for the default backend
-image_docker = "debian:12-slim"
+image_docker = "python:3.12-slim"   # must have python3: the file tools run on it (debian:12-slim has none)
 image_lxc = "debian/bookworm/amd64" # dist/release/arch[/variant] from the LXC "download" template
 image_qemu = "debian-12"            # a file in [qemu] images_dir, or a [qemu.images.*] entry
 cpus = 1.0

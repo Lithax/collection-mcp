@@ -53,6 +53,7 @@ SandboxArg = Annotated[str | None, Field(
                 "Omit to use your default (see set_defaults) or the server's default sandbox.")]
 
 
+BackendName = Annotated[str | None, Field(description="docker | lxc | qemu (default: the server's default backend)")]
 SandboxName = Annotated[str | None, Field(
     description="Sandbox name. Omit to use your default (see set_defaults).")]
 
@@ -345,6 +346,10 @@ def register_sandbox_tools(mcp: FastMCP, hub: Hub) -> None:
         rec = await anyio.to_thread.run_sync(mgr.create, name, overrides, start)
         hub.forget(rec.name)
         d = await anyio.to_thread.run_sync(mgr.describe, rec)
+        if start and await anyio.to_thread.run_sync(mgr.has_python, rec) is False:
+            d["warning"] = ("this image has no python3, which read_file, write_file, edit_file, grep and the other "
+                            "file tools run on (run_command and transfer_files still work). Recreate the sandbox "
+                            "with an image that has it, e.g. image=\"python:3.12-slim\".")
         if hub.defaults.adopt_created and hub.defaults.current().adopt(rec.name, server_default=cfg.tools.default_sandbox):
             d["note"] = "now your default sandbox: omit `sandbox` to use it"
         return hub.dump(d)
@@ -402,23 +407,23 @@ def register_sandbox_tools(mcp: FastMCP, hub: Hub) -> None:
         return f"{name} now expires in {int(rec.expires_at - mgr.reg.now())}s"
 
     @tool(read_only=True)
-    def image_list(backend: Annotated[str, Field(description="docker | lxc | qemu")]) -> str:
+    def image_list(backend: BackendName = None) -> str:
         """List images available for a backend (only those on the server's allow-list)."""
-        return json.dumps(mgr.list_images(backend), indent=2)
+        return json.dumps(mgr.list_images(backend or mgr.cfg.sandbox.backend), indent=2)
 
     @tool(read_only=False, open_world=True)
-    def image_pull(backend: Annotated[str, Field(description="docker | lxc | qemu")],
-                   image: Annotated[str, Field(description="docker: 'debian:12'. lxc: 'debian/bookworm/amd64'. "
-                                                           "qemu: the name of a declared image.")]) -> str:
+    def image_pull(image: Annotated[str, Field(description="docker: 'python:3.12-slim'. lxc: 'debian/bookworm/amd64'. "
+                                                           "qemu: the name of a declared image.")],
+                   backend: BackendName = None) -> str:
         """Download an image so sandboxes can use it. Only allow-listed (docker/lxc) or admin-declared,
         checksum-verified (qemu) images can be fetched."""
-        return mgr.pull_image(backend, image)
+        return mgr.pull_image(backend or mgr.cfg.sandbox.backend, image)
 
     @tool(read_only=False, destructive=True)
-    def image_remove(backend: Annotated[str, Field(description="docker | lxc | qemu")],
-                     image: Annotated[str, Field(description="Image reference.")]) -> str:
+    def image_remove(image: Annotated[str, Field(description="Image reference.")],
+                     backend: BackendName = None) -> str:
         """Remove a downloaded image (refused while a sandbox uses it)."""
-        mgr.remove_image(backend, image)
+        mgr.remove_image(backend or mgr.cfg.sandbox.backend, image)
         return f"removed {image}"
 
 

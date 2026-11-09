@@ -192,7 +192,9 @@ The model can override any of these for itself and fall back to them again by cl
 * Sandbox `env` values are stored with the sandbox (and in the LXC config file) — don't put real secrets there.
 * QEMU `outbound` uses user-mode networking: the guest can reach host loopback services at `10.0.2.2`. Use `local`/`none` if that matters. Docker/LXC `outbound` gives the guest whatever your chosen network/bridge allows — point `docker.outbound_network` at a firewalled network for egress control.
 * Strict shell modes (`readonly`/`allowlist`) are host-only; sandboxes use `standard`/`permissive` because the sandbox is the boundary.
-* File tools need `python3` in the image; `run_command` does not. QEMU images must run `qemu-guest-agent`.
+* File tools need `python3` in the image; `run_command` does not. The default image, `python:3.12-slim`, has it; `debian:*` slim images don't. `sandbox_create` checks, and adds a `warning` to its result when the image has no python3. QEMU images must run `qemu-guest-agent`.
+* `image_list`, `image_pull` and `image_remove` take an optional `backend`; without it they use the server's default backend.
+* With rootful Docker, files a root-running sandbox creates in a writable mapped folder are root-owned on the host (and git run as root there changes ownership inside `.git`). Set `[docker] user = "UID:GID"` to run as yourself (then installing packages inside the sandbox needs another route), or use rootless podman.
 * Running as root is discouraged everywhere (LXC refuses without `allow_privileged`; qemu warns).
 
 ## Tools

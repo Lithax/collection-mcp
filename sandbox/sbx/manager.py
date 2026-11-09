@@ -388,6 +388,17 @@ class Manager:
             raise SbxError(f"sandbox {rec.name!r} is not running anymore; use sandbox_start")
         return r
 
+    def has_python(self, rec: Record) -> bool | None:
+        """Does the sandbox have the python3 the filesystem tools run on? None when that can't be told
+        (the probe itself couldn't run). Uses the same lookup as the guest agent."""
+        # `command -v` of a missing command exits 1 in bash but 127 in dash, so say "missing" explicitly (3)
+        probe = "command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1 || exit 3"
+        try:
+            r = self.exec(rec, ExecRequest(["sh", "-c", probe], cwd="/", timeout=20, max_output=4096))
+        except SbxError:
+            return None
+        return None if r.timed_out else {0: True, 3: False}.get(r.exit_code)
+
     def fs_call(self, rec: Record, tool: str, args: dict[str, Any], fs_cfg: dict[str, Any]) -> dict[str, Any]:
         """Run one filesystem operation INSIDE the sandbox using the shipped agent (needs python3 there)."""
         from .backends.base import GUEST_PYTHON
@@ -399,8 +410,8 @@ class Manager:
         if r.timed_out:
             raise FsError("the filesystem operation timed out inside the sandbox")
         if r.exit_code == 127:
-            raise FsError("this sandbox image has no python3, which the filesystem tools need "
-                          "(run_command still works; install python3 or pick an image that has it)")
+            raise FsError("this sandbox image has no python3, which the filesystem tools need (run_command still "
+                          "works). Recreate the sandbox with an image that has it, e.g. image=\"python:3.12-slim\".")
         if r.truncated:
             raise FsError("result too large to return")
         try:

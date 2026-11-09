@@ -217,3 +217,36 @@ async def test_host_target_shell_and_fs(tmp_path, fake_docker):
         err, out = await c.call("run_command", command="touch hacked", cwd=str(host), sandbox="host")
         assert err                                  # readonly mode on the host: strict allow-list refuses it
         assert not (host / "hacked").exists()
+
+
+async def test_create_warns_when_the_image_has_no_python(tmp_path, fake_docker):
+    cfgfile, ws, host = write_config(tmp_path, extra='[images]\ndocker = ["python:*", "nopython:*"]')
+    async with Session(cfgfile) as c:
+        err, out = await c.call("sandbox_create", name="ok")              # the default image has python
+        assert not err, out
+        info = json.loads(out)
+        assert info["image"] == "python:3.12-slim" and "warning" not in info
+
+        err, out = await c.call("sandbox_create", name="bare", image="nopython:1")
+        assert not err, out
+        warning = json.loads(out)["warning"]
+        assert "no python3" in warning and "python:3.12-slim" in warning
+
+        # run_command works there; the file tools say what is wrong and how to fix it
+        err, out = await c.call("run_command", command="echo hi", sandbox="bare")
+        assert not err and "hi" in out
+        err, out = await c.call("read_file", path="x.txt", sandbox="bare")
+        assert err and "no python3" in out and "python:3.12-slim" in out
+
+
+async def test_image_tools_default_to_the_servers_backend(tmp_path, fake_docker):
+    cfgfile, ws, host = write_config(tmp_path)
+    async with Session(cfgfile) as c:
+        err, out = await c.call("image_list")                              # no backend given
+        assert not err and "debian:12-slim" in out and "secretcorp" not in out
+        err, out = await c.call("image_pull", image="python:3.12-slim")
+        assert not err and "pulled" in out
+        err, out = await c.call("image_remove", image="python:3.12-slim")
+        assert not err and "removed" in out
+        err, out = await c.call("image_list", backend="docker")            # still accepted
+        assert not err and "debian:12-slim" in out
