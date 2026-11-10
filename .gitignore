@@ -21,3 +21,4 @@ AGENTS.md
 **/*.token
 **/.github
 USAGE.md
+*.png
