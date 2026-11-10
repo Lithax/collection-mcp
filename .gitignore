@@ -20,5 +20,4 @@ AGENTS.md
 *.patch
 **/*.token
 **/.github
-USAGE.md
 *.png
