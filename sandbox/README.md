@@ -23,6 +23,7 @@ Optional: `pillow` lets `view_image` downscale big images.
 | `sbx/registry.py` | Durable per-sandbox records with `flock` locks. Sandboxes **survive server restarts**, and several server processes can share one `state_dir`. Only sandboxes in the registry are reachable, so the model can never touch other containers on your machine. |
 | `sbx/tools.py`, `sbx/server.py` | The MCP surface, HTTP transport (bearer token), CLI. |
 | `sbx/defaults.py` | Per-session defaults (`set_defaults`): argument values and output options set once instead of on every call. |
+| `sbx/activity.py` | The optional per-project hand-off log (`[collab] log`): which writable mapping a call touched, and the line written into its `.collab/calls.log`. |
 
 Because the backends are stateless, you can still run three separate servers from one install, sharing a state dir:
 `--tools sandbox`, `--tools fs`, `--tools shell`.
@@ -110,6 +111,40 @@ Things to know:
   9p is not fast for huge trees of tiny files.
 * A symlink inside a mapped folder is followed by the *sandbox*, in the sandbox's own filesystem, never on your host.
 * The mapping is fixed when the sandbox is created (stored in its record); editing the config later affects only new sandboxes.
+
+## Hand-off log (a per-project `.collab/calls.log`)
+
+Optional, off by default (`[collab] log = true`). Agents sometimes stop halfway (a chat ends, a sandbox is destroyed)
+and another one picks up the work. The notes they leave (`plan.md`, `scratchpad.md`) live in `<project>/.collab/`,
+where they survive; this adds what they can't be relied on to write themselves: a record of what was actually done.
+
+With it on, every file or shell call that touches a **writable** folder mapping appends one line to that mapping's
+`.collab/calls.log`:
+
+    2026-11-12T19:50:03Z | 3fa9c1 | run_command@work | cwd=router command="pytest -q" | exit 1 | 21004ms
+
+Fields: UTC time, chat tag, `tool@sandbox`, arguments, outcome (`ok`, `exit N`, `timeout`, `ERR ...`), duration.
+
+* **Which project:** the mapping that contains the call's path (file tools) or working directory (`run_command`); the
+  innermost mapping wins and relative paths resolve against the sandbox workdir. Calls that touch no writable mapping,
+  calls in read-only mappings, calls inside `.collab/` itself (the agents' own notes) and `transfer_files` leave no
+  line. Paths are shown relative to the mapping.
+* **Per project, so the same permissions:** the log lives in the mapped folder, so removing the mapping removes access
+  to it, and two agents on different projects never share one. Two agents on the same project do; the chat tag (6 hex
+  per live MCP session, best effort) tells them apart.
+* **Written by the server, on the host:** the files belong to the host user, not root, and the model never learns a
+  host path. `.collab/` is created, with a `.gitignore` containing `*` (so git ignores the folder, that file
+  included, without touching the project's own `.gitignore`), in every writable mapping when a sandbox is created or
+  started. That way it is the host user's even if an agent's first action is to write a note into it; a `.collab/`
+  that something inside the sandbox created first, as root, can't be written by the server (it says so once on
+  stderr and carries on), so `chown` it to the host owner.
+* **Never logged:** results, file contents (the tools pass sizes), env values. Commands go through the same redactor as
+  command output. Best effort, so don't count on it to hide a secret.
+* **Size:** past `max_bytes` (default 5 MB) the log moves to `calls.log.1`. It is opened for every line, so deleting
+  or truncating it while the server runs is fine. A failure to write never fails a call.
+
+The router has its own, separate, optional gateway-wide log (`ROUTER_CALL_LOG`, see `router/README.md`). It can't tell
+which project a call touches, which is why this one lives here.
 
 ## Defaults: say it once
 

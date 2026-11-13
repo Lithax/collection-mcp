@@ -32,6 +32,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from . import activity as act
 from . import defaults as dfl
 from . import shellcore as sc
 from .backends.base import ExecRequest
@@ -97,6 +98,7 @@ class Hub:
         self.limiter = sc.RateLimiter(g.rate_limit_per_minute)
         self.slots = threading.BoundedSemaphore(g.max_concurrent)
         self.redact = sc.Redactor(g)
+        self.activity = act.ActivityLog(cfg.collab, self.redact.clean)
         self._rt: dict[str, ShellRuntime] = {}
         self.sessions = ses.SessionStore()
         self.defaults = dfl.DefaultsStore(cfg.defaults.input, cfg.defaults.output, adopt_created=cfg.defaults.adopt_created)
@@ -205,6 +207,23 @@ class Hub:
         with self._lock:
             for k in [k for k in self._rt if k.split(":")[0] == name]:
                 del self._rt[k]
+
+    # -- hand-off log -------------------------------------------------------------------
+    def note_activity(self, sandbox: str | None, tool: str, args: dict[str, Any], outcome: str, ms: float,
+                      paths: list[str] | None = None) -> None:
+        """One line in the .collab/calls.log of the project the call touched (see activity.py). Never raises."""
+        if not self.activity.enabled:
+            return
+        try:
+            t = self.target(sandbox)
+            if t.kind != "sandbox":
+                return
+            spec = t.rec.spec
+            self.activity.note(spec.mounts, spec.workdir, tool=tool, sandbox=t.name, args=args,
+                               paths=act.paths_of(args) if paths is None else paths, outcome=outcome, ms=ms,
+                               session=self.defaults.current())
+        except Exception:  # noqa: BLE001 - the log must never fail a call
+            pass
 
 
 # ------------------------------------------------------------------------ helpers
@@ -345,6 +364,7 @@ def register_sandbox_tools(mcp: FastMCP, hub: Hub) -> None:
                           + f"\n\nbackend={spec.backend} image={spec.image} network={spec.network}")
         rec = await anyio.to_thread.run_sync(mgr.create, name, overrides, start)
         hub.forget(rec.name)
+        hub.activity.prepare(rec.spec.mounts)
         d = await anyio.to_thread.run_sync(mgr.describe, rec)
         if start and await anyio.to_thread.run_sync(mgr.has_python, rec) is False:
             d["warning"] = ("this image has no python3, which read_file, write_file, edit_file, grep and the other "
@@ -380,6 +400,7 @@ def register_sandbox_tools(mcp: FastMCP, hub: Hub) -> None:
         name = hub.sandbox_name(name)
         rec = mgr.start(name)
         hub.sessions.reset(name)
+        hub.activity.prepare(rec.spec.mounts)
         return hub.dump(mgr.describe(rec))
 
     @tool(read_only=False)
@@ -445,8 +466,10 @@ def register_fs_tools(mcp: FastMCP, hub: Hub) -> None:
             err = str(e)[:300]
             raise
         finally:
+            ms = round((time.monotonic() - t0) * 1000, 1)
             audit.log({"tool": tool_name, "sandbox": sandbox or cfg.tools.default_sandbox, "args": log_args,
-                       "ok": err is None, "error": err, "ms": round((time.monotonic() - t0) * 1000, 1)})
+                       "ok": err is None, "error": err, "ms": ms})
+            hub.note_activity(sandbox, tool_name, log_args, act.error_outcome(err), ms)
 
     def text(tool_name: str, sandbox: str | None, **args: Any) -> str:
         return run(tool_name, sandbox, args, **args)["text"]
@@ -624,6 +647,9 @@ def register_shell_tools(mcp: FastMCP, hub: Hub) -> None:
                    "outcome": outcome, "level": sc.LEVELS[d.level] if d else None,
                    "rules": sorted({f.rule for f in d.findings}) if d else [],
                    "violations": d.violations if d else [], "ms": round(ms, 1), **extra})
+        hub.note_activity(tgt, "run_command", {"cwd": cwd, "command": command},
+                          act.shell_outcome(outcome, extra.get("exit_code"), extra.get("timed_out")), ms,
+                          paths=[cwd] if cwd else [])
 
     @tool(read_only=False, destructive=True, open_world=True)
     async def run_command(
