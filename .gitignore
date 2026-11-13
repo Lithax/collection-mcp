@@ -21,3 +21,8 @@ AGENTS.md
 **/*.token
 **/.github
 *.png
+# working state of collaborating agents (plan, scratchpad, setup script) and the router's optional call log,
+# see skills/router-sandbox/references/handoff.md
+.collab/
+# built skill archives, see skills/README.md
+skills/*.zip
