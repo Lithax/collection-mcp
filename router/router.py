@@ -74,13 +74,13 @@ MAX_CHARS = int(os.environ.get("ROUTER_MAX_CHARS", "20000"))  # text per result
 MAX_IMAGE_CHARS = int(os.environ.get("ROUTER_MAX_IMAGE_CHARS", "7000000"))  # base64 chars per image/audio (~5 MB)
 SESSION_IDLE = float(os.environ.get("ROUTER_SESSION_IDLE", "14400"))  # close per-client sessions idle this long
 MAX_SESSIONS = int(os.environ.get("ROUTER_MAX_SESSIONS", "16"))  # per-client sessions kept per server
-# Off unless ROUTER_CALL_LOG says otherwise: `on` (the repo's .collab/calls.log, gitignored), a file path, or
+# Off unless ROUTER_CALL_LOG says otherwise: `on` (the repo's .collab/router-calls.log, gitignored), a file path, or
 # off/0/false/no/none. One line per tool call goes to it (see calllog.py). One router serves every chat and
 # server and can't tell which sandbox or project a call touches, so this is one gateway-wide stream; for
 # per-project hand-off use the sandbox's own [collab] log.
 CALL_LOG = calllog.CallLog(
     calllog.resolve_path(
-        os.environ.get("ROUTER_CALL_LOG"), Path(__file__).resolve().parent.parent / ".collab" / "calls.log"
+        os.environ.get("ROUTER_CALL_LOG"), Path(__file__).resolve().parent.parent / ".collab" / "router-calls.log"
     ),
     max_bytes=int(os.environ.get("ROUTER_CALL_LOG_MAX", calllog.DEFAULT_MAX_BYTES)),  # bytes before it rotates
 )

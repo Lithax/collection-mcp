@@ -19,7 +19,7 @@ Env vars: `ROUTER_CONFIG`, `ROUTER_HOST`, `ROUTER_PORT`, and these limits (defau
 | `ROUTER_MAX_IMAGE_CHARS` (7000000) | base64 characters per image/audio block (about 5 MB); bigger ones become a text note |
 | `ROUTER_SESSION_IDLE` (14400) | seconds of silence after which a chat's upstream session is closed |
 | `ROUTER_MAX_SESSIONS` (16) | chat sessions kept open per server (least recently used closed first) |
-| `ROUTER_CALL_LOG` (off) | turns the call log on: `on` writes `<repo>/.collab/calls.log`, a path writes that file; `off` (also `0`, `false`, `no`, `none`) or unset leaves it off (see Call log) |
+| `ROUTER_CALL_LOG` (off) | turns the call log on: `on` writes `<repo>/.collab/router-calls.log` (not `calls.log`: that name is the sandbox's per-project log), a path writes that file; `off` (also `0`, `false`, `no`, `none`) or unset leaves it off (see Call log) |
 | `ROUTER_CALL_LOG_MAX` (5000000) | bytes after which the log is moved to `<file>.1` and started again |
 
 ## Add servers from the command line
@@ -137,7 +137,7 @@ with idle timeouts from giving up. Your client or tunnel may still have a limit 
 ## Call log
 Optional, off by default. With `ROUTER_CALL_LOG` set, every tool call the router handles, its own tools and
 forwarded ones alike, is appended to one file as one line, so a person can `tail` or `grep` what went
-through the gateway. `ROUTER_CALL_LOG=on` writes `.collab/calls.log` in this repo (gitignored); a path
+through the gateway. `ROUTER_CALL_LOG=on` writes `.collab/router-calls.log` in this repo (gitignored); a path
 writes that file.
 
 It is a gateway-wide stream, not a project log: the router is deliberately opaque and can't tell which
