@@ -19,6 +19,8 @@ Env vars: `ROUTER_CONFIG`, `ROUTER_HOST`, `ROUTER_PORT`, and these limits (defau
 | `ROUTER_MAX_IMAGE_CHARS` (7000000) | base64 characters per image/audio block (about 5 MB); bigger ones become a text note |
 | `ROUTER_SESSION_IDLE` (14400) | seconds of silence after which a chat's upstream session is closed |
 | `ROUTER_MAX_SESSIONS` (16) | chat sessions kept open per server (least recently used closed first) |
+| `ROUTER_CALL_LOG` (off) | turns the call log on: `on` writes `<repo>/.collab/calls.log`, a path writes that file; `off` (also `0`, `false`, `no`, `none`) or unset leaves it off (see Call log) |
+| `ROUTER_CALL_LOG_MAX` (5000000) | bytes after which the log is moved to `<file>.1` and started again |
 
 ## Add servers from the command line
 Point the CLI at something that's already running; it works out the rest.
@@ -131,6 +133,32 @@ The router waits `ROUTER_TIMEOUT` seconds (60) for an upstream call. A call that
 `ROUTER_MAX_TIMEOUT` (900). While a call is slow the router sends the client a progress notification
 every `ROUTER_KEEPALIVE` seconds (15), if the client asked for progress; that keeps proxies and clients
 with idle timeouts from giving up. Your client or tunnel may still have a limit of its own.
+
+## Call log
+Optional, off by default. With `ROUTER_CALL_LOG` set, every tool call the router handles, its own tools and
+forwarded ones alike, is appended to one file as one line, so a person can `tail` or `grep` what went
+through the gateway. `ROUTER_CALL_LOG=on` writes `.collab/calls.log` in this repo (gitignored); a path
+writes that file.
+
+It is a gateway-wide stream, not a project log: the router is deliberately opaque and can't tell which
+sandbox or project a call touches, so every chat and every server lands in the same file. For a hand-off
+log per project, use the sandbox server's own `[collab] log` (see `sandbox/README.md`).
+
+    2026-11-12T07:31:07Z | 3fa9c1 | sandbox.run_command | command="pytest -q" sandbox=work | ok | 1204ms
+
+- Fields: UTC time, chat, `server.tool`, arguments, outcome, duration. The chat is 6 hex characters made
+  from the downstream client's session id, so interleaved chats can be told apart (`-` when the client
+  can't be told from another). The log is shared by every chat and server.
+- Outcome: `ok`, `exit N` (the sandbox's non-zero `exit code: N`), `ERR <message>` (upstream errors that
+  `call_tool` hands back as an ordinary result count too) or `cancelled`.
+- Results are never logged. Arguments are cut to about 100 characters per value, file bodies and stdin
+  become a size (`content=<1656 chars>`), `env` and `headers` a count, and values under keys like `token`,
+  `password` or `api_key`, `KEY=value` secrets in command text, bearer tokens, common token formats and
+  `user:password@` in URLs are masked. That is best effort: don't rely on it to hide a secret.
+- Past `ROUTER_CALL_LOG_MAX` bytes the file moves to `<file>.1` (one older file is kept). It is created
+  private (0600) and opened for every write, so deleting or truncating it while the router runs is fine.
+  If it can't be written the router says so once on stderr and carries on; a call never fails because of it.
+- The tests switch it off (`tests/conftest.py`) so a test run doesn't write to the real log.
 
 ## Notes
 - Entries can set `"transport": "sse"` for legacy SSE servers (the CLI does this for you).
