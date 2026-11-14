@@ -99,7 +99,7 @@ When the administrator enabled `[collab] log` on the sandbox server, every file 
 2026-11-12T19:50:41Z | 3fa9c1 | edit_file@work | path=router/router.py edits=<2 items> | ok | 12ms
 ```
 
-Fields: UTC time, chat tag, `tool@sandbox`, arguments (paths relative to the project), outcome (`ok`, `exit N`, `timeout`, `ERR message`), duration. Results and file contents are never logged. The chat tag is the same for one live session and differs between chats, so it separates two agents working in the same project; it is best effort and can change when the connection is re-established.
+Fields: UTC time, chat tag, `tool@sandbox`, arguments (paths relative to the project), outcome (`ok`, `exit N`, `timeout`, `ERR message`), duration. Results and file contents are never logged. The chat tag labels the MCP session a call arrived on. It separates two agents in the same project only when the router keeps one session per chat; when every call arrives on a fresh session (the same cause as `set_defaults` not sticking) each line gets its own tag and it tells you nothing, so go by the timestamps and paths instead.
 
 It lives in the project, so it only holds calls that touched this project; calls in other projects, outside any mapping, or inside `.collab/` itself are not in it. If the file doesn't exist, the log is not enabled: rely on the plan, the scratchpad and `git diff`, and mention it to the user only if you needed it.
 
