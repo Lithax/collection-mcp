@@ -115,6 +115,13 @@ carries no identity, so those calls fall back to one shared session and nothing 
 A server entry can also set `"mode": "legacy"` to make the router itself use the classic handshake
 toward that server, which is what servers with per-session state want.
 
+**When defaults never stick.** Some connectors give the router a different client identity on every call (seen
+with a hosted connector behind a tunnel). Then `auto` / `per_client` quietly turns into one new upstream session per
+call: the sandbox's `set_defaults` is forgotten on the very next call, and every line of the sandbox's hand-off log
+gets its own chat tag. `"mode": "legacy"` does not help here (the handshake toward the server isn't the problem);
+set `"sessions": "shared"` on that entry instead. It is re-read live, `list_servers` shows it, and the price is that
+all chats then share one session and one set of defaults.
+
 ## Images and audio
 Results from an upstream tool pass through as MCP content blocks: text (capped, see above), images
 and audio untouched, so tools like the sandbox's `view_image` work. A block bigger than

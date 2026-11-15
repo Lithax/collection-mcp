@@ -131,9 +131,10 @@ Fields: UTC time, chat tag, `tool@sandbox`, arguments, outcome (`ok`, `exit N`, 
   line. Paths are shown relative to the mapping.
 * **Per project, so the same permissions:** the log lives in the mapped folder, so removing the mapping removes access
   to it, and two agents on different projects never share one. Two agents on the same project do; the chat tag (6 hex
-  per MCP session) tells them apart when the router keeps one session per chat. If every call reaches the sandbox on a
-  fresh session (then `set_defaults` doesn't stick either; see the `"mode": "legacy"` note in `router/README.md`),
-  every line gets its own tag and only the timestamps and paths help.
+  per MCP session) tells them apart only when the router gives each chat its own session. If it can't recognise your
+  chat and gives every call a fresh session, each line gets its own tag (and `set_defaults` is forgotten at once); with
+  `"sessions": "shared"` everybody has the same tag (see the sessions note in `router/README.md`). Timestamps and
+  paths always work.
 * **Written by the server, on the host:** the files belong to the host user, not root, and the model never learns a
   host path. `.collab/` is created, with a `.gitignore` containing `*` (so git ignores the folder, that file
   included, without touching the project's own `.gitignore`), in every writable mapping when a sandbox is created or
