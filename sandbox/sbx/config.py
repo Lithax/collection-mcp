@@ -203,6 +203,7 @@ class AuditCfg:
 class CollabCfg:
     log: bool = False                  # one line per file/shell call -> <writable mapped folder>/.collab/calls.log
     max_bytes: int = 5_000_000         # past this size the log moves to calls.log.1
+    fallback: str = ""                 # a writable [mounts.NAME]: also gets the calls that touch no writable mapping
 
 
 @dataclass
@@ -451,6 +452,11 @@ def finalize(cfg: Config) -> Config:
 
     # ---- folder mappings: needs the (resolved) state/config/audit paths above ------------------
     cfg.mounts = mountslib.finalize(cfg)
+    fb = cfg.collab.fallback.strip()
+    if fb and (fb not in cfg.mounts or cfg.mounts[fb]["mode"] != "rw"):
+        raise ConfigError(f"[collab] fallback = {fb!r} must name a writable mapping (declare it under [mounts.{fb}] "
+                          "with mode = \"rw\")")
+    cfg.collab.fallback = fb
 
     # ---- shell: [shell.<section>] tables use shell_mcp's own keys -----------------------------
     updates = shellcore.apply_schema(cfg.shell, "shell.")
@@ -850,9 +856,13 @@ shell = false
 
 [collab]
 # Hand-off aid for agents that take over from each other. With log = true the server appends one line per
-# file/shell call to .collab/calls.log inside the writable [mounts.*] folder the call touched, so every project
-# gets its own log and it disappears with the mapping. Calls that touch no writable mapping, and calls inside
-# .collab itself, are not logged. Written by the server on the host; the model never sees host paths.
+# file/shell call to .collab/calls.log inside every writable [mounts.*] folder the call touched (a shell command
+# counts for the directory it runs in and the absolute paths in its text), so every project gets its own log and
+# it disappears with the mapping. <parent>/build-<project>, the scratch copy agents develop in, counts as <project>.
+# Calls inside .collab itself are not logged; calls that touch no writable mapping are not logged either, unless
+# fallback names one: then they go to that mapping's log. Written by the server on the host; the model never sees
+# host paths.
 # log = true
 # max_bytes = 5000000               # past this the log moves to calls.log.1
+# fallback = "myproject"            # a writable [mounts.myproject]: also gets calls outside every mapping (/tmp, /workspace/x)
 '''

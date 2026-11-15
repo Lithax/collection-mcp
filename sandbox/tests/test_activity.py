@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from sbx import activity as act  # noqa: E402
 from sbx import config as C  # noqa: E402
 from sbx.backends.base import Mount  # noqa: E402
+from sbx.errors import ConfigError  # noqa: E402
 from test_e2e import Session, write_config, anyio_backend  # noqa: E402,F401  (fixture re-export)
 
 WORKDIR = "/workspace"
@@ -162,12 +163,108 @@ def test_prepare_creates_the_folder_up_front_for_writable_mappings_only(tmp_path
     assert not (ro / ".collab").exists()                         # disabled: nothing happens
 
 
-def test_the_first_path_that_hits_a_project_decides(tmp_path):
+def test_every_project_a_call_touches_gets_its_line(tmp_path):
     a, b, ms = two_projects(tmp_path)
     log = act.ActivityLog(cfg())
-    note(log, ms, "/tmp/none", paths=["/tmp/none", "/workspace/b/src", "/workspace/a/x"],
+    note(log, ms, "/tmp/none", paths=["/tmp/none", "/workspace/b/src", "/workspace/a/x", "/workspace/a/y"],
          args={"source": "/workspace/b/src", "destination": "/workspace/a/x"}, tool="copy_path")
-    assert (b / ".collab" / "calls.log").exists() and not (a / ".collab").exists()
+    la = (a / ".collab" / "calls.log").read_text().splitlines()
+    lb = (b / ".collab" / "calls.log").read_text().splitlines()
+    assert len(la) == len(lb) == 1                                   # a is named twice, still one line there
+    assert la[0].split(" | ")[3] == "source=/workspace/b/src destination=x"    # paths: relative to this project,
+    assert lb[0].split(" | ")[3] == "source=src destination=/workspace/a/x"    # absolute when outside it
+
+
+def test_a_build_copy_counts_as_its_project(tmp_path):
+    a, b, ms = two_projects(tmp_path)
+    ms[1] = Mount(str(b), "/workspace/b", "rw", "bee")                # folder name and mapping name may differ
+    assert act.mount_for(ms, WORKDIR, "/workspace/build-a/src/x.py") == (ms[0], "src/x.py")
+    assert act.mount_for(ms, WORKDIR, "/workspace/build-b") == (ms[1], ".")
+    assert act.mount_for(ms, WORKDIR, "/workspace/build-bee/x") == (ms[1], "x")
+    assert act.mount_for(ms, WORKDIR, "/workspace/build-a/.collab/plan.md") is None
+    assert act.mount_for(ms, WORKDIR, "/workspace/build-c/x") is None
+    assert act.mount_for(ms, WORKDIR, "/workspace/build-ab/x") is None   # shares a prefix, not the name
+    assert act.mount_for(ms, WORKDIR, "/workspace/bst/x") is None        # any other copy is not guessed at
+    both = [Mount("/h/a", "/workspace/a", "rw", "a"), Mount("/h/x", "/workspace/build-a", "rw", "x")]
+    assert act.mount_for(both, WORKDIR, "/workspace/build-a/f")[0] is both[1]    # a real mapping beats a build copy
+    note(act.ActivityLog(cfg()), ms, "/workspace/build-a/src/x.py")
+    assert "path=/workspace/build-a/src/x.py " in (a / ".collab" / "calls.log").read_text()
+
+
+def test_classify_tells_notes_and_outside_apart():
+    rw = [Mount("/h/p", "/workspace/p", "rw", "p")]
+    ro = [Mount("/h/ref", "/workspace/ref", "ro", "ref")]
+    assert act.classify(rw, WORKDIR, "/workspace/p/.collab/x") == ("notes",)
+    assert act.classify(rw, WORKDIR, "/workspace/p/src") == ("mount", rw[0], "src")
+    assert act.classify(rw, WORKDIR, "/tmp/x") == ("outside",)
+    assert act.classify(ro, WORKDIR, "/workspace/ref/x") == ("outside",)         # read-only: not a project to log in
+    assert act.classify(ro, WORKDIR, "/workspace/build-ref/x") == ("outside",)
+
+
+def test_shell_paths_follow_a_leading_cd_and_every_absolute_path():
+    sp = act.shell_paths
+    assert sp("/workspace/a", "pytest -q") == ["/workspace/a"]
+    assert sp("/workspace/a", "cd /workspace && ls bst") == ["/workspace"]           # it ran elsewhere than it started
+    assert sp("/workspace", 'cd "/workspace/p" && git commit -m x') == ["/workspace/p"]
+    assert sp("/workspace/p", "cd src; ls") == ["/workspace/p/src"]
+    assert sp("/workspace/p", "cd -- .. && ls") == ["/workspace"]
+    assert sp("/workspace/bst", "cp x.js /workspace/p/x.js && chown 1000:1000 /workspace/p/x.js") \
+        == ["/workspace/bst", "/workspace/p/x.js"]
+    assert sp("/workspace", "curl -s https://example.com/a/b | tar -xz -C /tmp/z") == ["/workspace", "/tmp/z"]
+    assert sp("/workspace", "ls --color=/workspace/q/*.py") == ["/workspace", "/workspace/q"]
+    assert sp(None, "cat /workspace/p/x") == ["/workspace/p/x"]
+    assert sp("/workspace/p", "cd $DIR && ls") == ["/workspace/p"]                 # variables are not followed
+    assert len(sp("/", " ".join(f"/p{i}" for i in range(100)))) == 40
+
+
+def test_a_shell_call_is_logged_where_it_ran_and_where_its_paths_point(tmp_path):
+    a, b, ms = two_projects(tmp_path)
+    log = act.ActivityLog(cfg())
+    cmd = "cp x.js /workspace/a/x.js && chown 1000:1000 /workspace/a/x.js"
+    assert note(log, ms, "/workspace/bst", tool="run_command", args={"cwd": "/workspace/bst", "command": cmd},
+                paths=act.shell_paths("/workspace/bst", cmd))
+    line = (a / ".collab" / "calls.log").read_text().splitlines()[0]
+    assert line.split(" | ")[3].startswith("cwd=/workspace/bst command=") and not (b / ".collab").exists()
+
+
+# ---- the fallback ----------------------------------------------------------------------------------
+def test_calls_that_touch_no_mapping_go_to_the_fallback_when_there_is_one(tmp_path):
+    a, b, ms = two_projects(tmp_path)
+    log = act.ActivityLog(cfg(fallback="b"))
+    assert note(log, ms, "/workspace/bst/x.js")
+    assert not (a / ".collab").exists()
+    lines = (b / ".collab" / "calls.log").read_text().splitlines()
+    assert len(lines) == 1 and lines[0].split(" | ")[3] == "path=/workspace/bst/x.js content_bytes=5"
+    assert note(log, ms, "/workspace/a/x")                                # touches a project: goes there, not to b
+    assert len((b / ".collab" / "calls.log").read_text().splitlines()) == 1
+    assert (a / ".collab" / "calls.log").exists()
+    assert not note(log, ms, "/workspace/a/.collab/plan.md")              # the agents' own notes: never
+    assert not note(log, ms, "/tmp/x", paths=["/tmp/x", "/workspace/a/.collab/plan.md"])
+    assert not note(log, ms, "/tmp/x", paths=[])                           # names no path at all: nothing touched
+    assert len((b / ".collab" / "calls.log").read_text().splitlines()) == 1
+
+
+def test_a_fallback_that_is_not_writable_in_this_sandbox_logs_nothing(tmp_path):
+    a, b, ms = two_projects(tmp_path)
+    assert not note(act.ActivityLog(cfg(fallback="elsewhere")), ms, "/tmp/x")
+    (tmp_path / "ro").mkdir()
+    ro = [Mount(str(tmp_path / "ro"), "/workspace/ro", "ro", "ro")]
+    assert not note(act.ActivityLog(cfg(fallback="ro")), ro, "/tmp/x")
+    assert not (tmp_path / "ro" / ".collab").exists() and not (a / ".collab").exists()
+    assert not note(act.ActivityLog(cfg(log=False, fallback="a")), ms, "/tmp/x")      # off is off
+
+
+def test_the_fallback_must_name_a_writable_mapping(tmp_path, fake_docker):
+    from conftest import make_cfg
+    (tmp_path / "p").mkdir()
+    (tmp_path / "r").mkdir()
+    mounts = {"p": {"host": str(tmp_path / "p"), "guest": "/workspace/p", "mode": "rw"},
+              "r": {"host": str(tmp_path / "r"), "guest": "/workspace/r"}}
+    assert make_cfg(tmp_path, mounts=mounts, collab={"fallback": " p "}).collab.fallback == "p"
+    assert make_cfg(tmp_path, mounts=mounts).collab.fallback == ""
+    for bad in ("nope", "r"):
+        with pytest.raises(ConfigError, match="must name a writable mapping"):
+            make_cfg(tmp_path, mounts=mounts, collab={"fallback": bad})
 
 
 def test_rotation_keeps_one_older_file(tmp_path):
@@ -207,12 +304,12 @@ def test_session_tags_are_stable_per_session_and_dash_when_unknown():
 
 
 # ---- end to end: a real server over stdio against the fake docker --------------------------------------
-def e2e_config(tmp_path, collab: bool):
-    proj = tmp_path / "proj"
-    proj.mkdir()
+def e2e_config(tmp_path, collab: bool, fallback: bool = False, inside_ws: bool = False):
+    proj = tmp_path / "guest-ws" / "proj" if inside_ws else tmp_path / "proj"   # inside the workdir: build-proj reachable
+    proj.mkdir(parents=True)
     extra = f'[mounts.proj]\nhost = "{proj}"\nguest = "{proj}"\nmode = "rw"\n'   # fake guest fs == host fs
     if collab:
-        extra += "[collab]\nlog = true\n"
+        extra += "[collab]\nlog = true\n" + ('fallback = "proj"\n' if fallback else "")
     cfgfile, ws, _ = write_config(tmp_path, extra=extra)
     text = open(cfgfile).read().replace("[sandbox]\n", '[sandbox]\nmounts = ["proj"]\n', 1)
     open(cfgfile, "w").write(text)
@@ -244,6 +341,56 @@ async def test_e2e_calls_are_logged_in_the_project_they_touched(tmp_path, fake_d
     assert lines[3].split(" | ")[3] == "cwd=. command=false" and lines[3].split(" | ")[4] == "exit 1"
     assert (proj / ".collab" / ".gitignore").read_text() == "*\n"
     assert "my notes" not in (proj / ".collab" / "calls.log").read_text()                 # bodies are never logged
+
+
+@pytest.mark.anyio
+async def test_e2e_work_outside_the_mapping_still_reaches_the_project_log(tmp_path, fake_docker):
+    cfgfile, ws, proj = e2e_config(tmp_path, collab=True, inside_ws=True)
+    build = ws / "build-proj"                       # the scratch copy the router-sandbox skill tells agents to use
+    readme = tmp_path / "hostfiles" / "readme.txt"
+    async with Session(cfgfile) as c:
+        err, out = await c.call("sandbox_create", name="w")
+        assert not err, out
+        for tool, args in [
+            ("write_file", dict(path=f"{build}/x.js", content="1")),                          # build copy
+            ("run_command", dict(command=f"cp x.js {proj}/x.js", cwd=str(build))),            # ran in the copy, wrote in the mount
+            ("run_command", dict(command=f"cd {proj} && ls", cwd=str(ws))),                  # leading cd decides
+            ("run_command", dict(command="echo elsewhere", cwd=str(ws))),                    # touches no project
+            ("transfer_files", dict(source_sandbox="host", source_path=str(readme), destination_sandbox="w",
+                                    destination_path=f"{proj}/readme.txt")),
+            ("transfer_files", dict(source_sandbox="w", source_path=f"{proj}/readme.txt", destination_sandbox="w",
+                                    destination_path=str(ws / "copy.txt"))),
+        ]:
+            err, out = await c.call(tool, **({} if tool == "transfer_files" else {"sandbox": "w"}), **args)
+            assert not err, (tool, out)
+    lines = [ln.split(" | ") for ln in (proj / ".collab" / "calls.log").read_text().splitlines()]
+    assert [ln[2] for ln in lines] == ["write_file@w", "run_command@w", "run_command@w", "transfer_files@w",
+                                       "transfer_files@w"]
+    assert lines[0][3] == f"path={build}/x.js content_bytes=1"                              # absolute: outside the mount
+    assert lines[1][3].startswith(f"cwd={build} command=") and lines[1][4] == "ok"
+    assert lines[2][3].startswith(f"cwd={ws} command=") and "cd " in lines[2][3]
+    assert f"source_path={readme}" in lines[3][3] and "destination_path=readme.txt" in lines[3][3]
+    assert "source_path=readme.txt" in lines[4][3] and f"destination_path={ws}/copy.txt" in lines[4][3]
+    assert not (ws / ".collab").exists() and not (tmp_path / ".collab").exists()           # nothing else was created
+
+
+@pytest.mark.anyio
+async def test_e2e_the_fallback_gets_what_touches_no_mapping(tmp_path, fake_docker):
+    cfgfile, ws, proj = e2e_config(tmp_path, collab=True, fallback=True)
+    async with Session(cfgfile) as c:
+        err, out = await c.call("sandbox_create", name="w")
+        assert not err, out
+        for tool, args in [
+            ("run_command", dict(command="echo elsewhere", cwd=str(ws))),
+            ("list_directory", dict(path=str(ws))),
+            ("list_allowed_directories", dict()),                                               # names no path
+            ("write_file", dict(path=f"{proj}/.collab/plan.md", content="my notes")),         # the agents' own notes
+        ]:
+            err, out = await c.call(tool, sandbox="w", **args)
+            assert not err, (tool, out)
+    lines = [ln.split(" | ") for ln in (proj / ".collab" / "calls.log").read_text().splitlines()]
+    assert [ln[2] for ln in lines] == ["run_command@w", "list_directory@w"]
+    assert lines[0][3] == f'cwd={ws} command="echo elsewhere"' and lines[1][3].startswith(f"path={ws} ")
 
 
 @pytest.mark.anyio

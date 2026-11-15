@@ -4,15 +4,19 @@ Agents take over from each other (a chat ends, a sandbox is recreated). The plan
 `<project>/.collab/`; this adds what they can't be relied on to write themselves: a record of what was actually
 done. Off unless `[collab] log = true`.
 
-A call is attributed to the writable mapping that contains its path (file tools) or working directory (shell),
-and the line goes to `<that mapping's host folder>/.collab/calls.log`. Calls that touch no writable mapping, and
-calls inside `.collab` itself (the agents' own notes), leave no line. The server writes on the host as its own
+A call is attributed to every writable mapping it touches: the ones containing its path (file tools) or the
+directory a shell command runs in and the absolute paths its text names. Each gets a line in
+`<that mapping's host folder>/.collab/calls.log`. `<parent>/build-<project>`, the scratch copy agents develop in
+because the mapping itself is the user's real files, counts as `<project>`. Calls inside `.collab` itself (the
+agents' own notes) leave no line. A call that touches no writable mapping at all leaves no line either, unless
+`[collab] fallback` names a writable mapping: then it goes to that one. The server writes on the host as its own
 user, so the files belong to the host user, and the model never learns a host path.
 
     2026-11-12T19:50:03Z | 3fa9c1 | run_command@work | cwd=router command="pytest -q" | exit 1 | 21004ms
 
 Fields: UTC time | chat (6 hex per live MCP session, best effort) | tool@sandbox | arguments | outcome | duration.
-Paths are shown relative to the mapping. Results are never logged. Commands go through the server's output
+Paths are shown relative to the mapping, or as absolute sandbox paths when they lie outside it (a build copy, /tmp).
+Results are never logged. Commands go through the server's output
 redactor; the file tools already pass sizes instead of file bodies.
 """
 
@@ -31,12 +35,17 @@ from typing import Any, Callable, Iterable
 
 COLLAB_DIR = ".collab"
 LOG_NAME = "calls.log"
+BUILD_PREFIX = "build-"  # <parent>/build-<project> is the scratch copy of the mapping <parent>/<project>
 ARG_LIMIT = 100    # characters kept of one argument value
 ERR_LIMIT = 140    # characters kept of an error message
 LINE_LIMIT = 500   # characters per line; the arguments are cut to fit
 _SCAN = 2000       # characters of a value handed to the redactor
-_PATH_KEYS = ("path", "paths", "source", "destination")
+_PATH_KEYS = ("path", "paths", "source", "destination", "source_path", "destination_path")
 _BARE = re.compile(r"[\w./:@+,~-]+")  # printed without quotes
+_CMD_SCAN = 20000  # characters of a shell command searched for paths
+_CMD_PATHS = 40    # paths taken from one shell command
+_ABS = re.compile(r"(?<![\w./~:-])/[\w.+@%,=~:-]*(?:/[\w.+@%,=~:-]*)*")  # an absolute path inside a command line
+_CD = re.compile(r"""^\s*cd\s+(?:--\s+)?(?:"([^"$`\\]+)"|'([^']+)'|([^\s;&|<>()$`\\"'*?\[\]{}~]+))\s*(?:&&|;|$)""")
 
 
 # ------------------------------------------------------------------------------------------ which project
@@ -45,23 +54,42 @@ def guest_path(workdir: str, path: str) -> str:
     return posixpath.normpath(path if path.startswith("/") else posixpath.join(workdir, path))
 
 
-def mount_for(mounts: Iterable[Any], workdir: str, path: str):
-    """(mount, path relative to it) for the mapping that contains `path`, if that mapping is writable and the path
-    is not inside its .collab folder; otherwise None. The innermost mapping wins, so a read-only mapping nested in
-    a writable one is respected."""
-    p = guest_path(workdir, path)
-    best = None
+def _roots(mounts: Iterable[Any]) -> list[tuple[str, Any, bool]]:
+    """(guest path, mapping, is_build_copy) for every place that belongs to a mapping: the mapping itself and its
+    `<parent>/build-<folder name>` / `<parent>/build-<mapping name>` scratch copy."""
+    out: list[tuple[str, Any, bool]] = []
     for m in mounts:
         g = posixpath.normpath(m.guest)
-        if p == g or p.startswith(g.rstrip("/") + "/"):
-            if best is None or len(g) > len(posixpath.normpath(best.guest)):
-                best = m
-    if best is None or not best.rw:
-        return None
-    rel = posixpath.relpath(p, posixpath.normpath(best.guest))
+        out.append((g, m, False))
+        for n in sorted({posixpath.basename(g), getattr(m, "name", "")} - {""}):
+            out.append((posixpath.join(posixpath.dirname(g), BUILD_PREFIX + n), m, True))
+    return out
+
+
+def classify(mounts: Iterable[Any], workdir: str, path: str):
+    """Where a sandbox path belongs: `("mount", mapping, path relative to its root)` inside a writable mapping or its
+    build copy; `("notes",)` inside a .collab folder (the agents' own notes); `("outside",)` anywhere else, read-only
+    mappings included. The innermost root wins (a real mapping beats a build copy of the same depth), so a read-only
+    mapping nested in a writable one is respected."""
+    p = guest_path(workdir, path)
+    best = None
+    for root, m, alias in _roots(mounts):
+        if p == root or p.startswith(root.rstrip("/") + "/"):
+            if best is None or (len(root), not alias) > (len(best[0]), not best[2]):
+                best = (root, m, alias)
+    if best is None or not best[1].rw:
+        return ("outside",)
+    rel = posixpath.relpath(p, best[0])
     if rel == COLLAB_DIR or rel.startswith(COLLAB_DIR + "/"):
-        return None
-    return best, rel
+        return ("notes",)
+    return ("mount", best[1], rel)
+
+
+def mount_for(mounts: Iterable[Any], workdir: str, path: str):
+    """(mapping, path relative to its root) if `path` is in a writable mapping (or its build copy) and not inside its
+    .collab folder; otherwise None."""
+    c = classify(mounts, workdir, path)
+    return (c[1], c[2]) if c[0] == "mount" else None
 
 
 def paths_of(args: dict[str, Any]) -> list[str]:
@@ -74,6 +102,22 @@ def paths_of(args: dict[str, Any]) -> list[str]:
         elif isinstance(v, (list, tuple)):
             out.extend(x for x in v if isinstance(x, str))
     return out
+
+
+def shell_paths(cwd: str | None, command: str) -> list[str]:
+    """The paths a shell call touches, best effort: where it effectively runs (the directory of a leading `cd`, else the
+    directory it started in), then every absolute path its text names. Relative paths after a later `cd`, variables
+    and globs are not followed."""
+    text = command[:_CMD_SCAN]
+    run_in = cwd
+    m = _CD.match(text)
+    if m:
+        run_in = posixpath.normpath(posixpath.join(cwd or ".", next(g for g in m.groups() if g)))
+    out = [run_in] if run_in else []
+    for tok in _ABS.findall(text):
+        out.append(posixpath.normpath(tok))
+    seen: set[str] = set()
+    return [p for p in out if not (p in seen or seen.add(p))][:_CMD_PATHS]
 
 
 # ------------------------------------------------------------------------------------------ the line
@@ -138,6 +182,7 @@ class ActivityLog:
     def __init__(self, cfg: Any, scrub: Callable[[str], str] = lambda s: s) -> None:
         self.enabled = bool(cfg.log)
         self.max_bytes = int(cfg.max_bytes)
+        self.fallback = str(getattr(cfg, "fallback", "") or "").strip()   # name of the [mounts.*] that gets the rest
         self.scrub = scrub
         self._tags: "weakref.WeakKeyDictionary[Any, str]" = weakref.WeakKeyDictionary()
         self._warned: set[str] = set()
@@ -154,22 +199,39 @@ class ActivityLog:
     def note(self, mounts: Iterable[Any], workdir: str, *, tool: str, sandbox: str, args: dict[str, Any],
              paths: list[str], outcome: str, ms: float, session: Any = None,
              now: dt.datetime | None = None) -> bool:
-        """Append a line for the call to the project it touched. Returns whether a line was written."""
+        """Append a line for the call to every writable mapping it touched. A call that touched none, and nothing in a
+        .collab folder, goes to the fallback mapping if one is configured. Returns whether a line was written."""
         if not self.enabled:
             return False
         try:
-            hit = next((h for h in (mount_for(mounts, workdir, p) for p in paths if p) if h), None)
-            if hit is None:
-                return False
-            mount = hit[0]
-            base = posixpath.normpath(mount.guest)
+            mounts = list(mounts)
+            targets: dict[str, Any] = {}      # guest path -> mapping, in the order first touched
+            notes = outside = False
+            for p in paths:
+                if not p:
+                    continue
+                c = classify(mounts, workdir, p)
+                if c[0] == "mount":
+                    targets.setdefault(posixpath.normpath(c[1].guest), c[1])
+                elif c[0] == "notes":
+                    notes = True
+                else:
+                    outside = True
+            if not targets and outside and not notes and self.fallback:
+                fb = next((m for m in mounts if m.name == self.fallback and m.rw), None)
+                if fb is not None:
+                    targets[posixpath.normpath(fb.guest)] = fb
+            wrote = False
+            for base, mount in targets.items():
+                def rel(p: str, base: str = base) -> str:
+                    gp = guest_path(workdir, p)
+                    if gp == base:
+                        return "."
+                    return posixpath.relpath(gp, base) if gp.startswith(base.rstrip("/") + "/") else gp
 
-            def rel(p: str) -> str:
-                gp = guest_path(workdir, p)
-                return "." if gp == base else posixpath.relpath(gp, base) if gp.startswith(base.rstrip("/") + "/") else p
-
-            line = format_line(self.tag(session), tool, sandbox, summarize(args, rel, self.scrub), outcome, ms, now)
-            return self._append(Path(mount.host), line)
+                line = format_line(self.tag(session), tool, sandbox, summarize(args, rel, self.scrub), outcome, ms, now)
+                wrote = self._append(Path(mount.host), line) or wrote
+            return wrote
         except Exception as e:  # noqa: BLE001
             self._warn("activity", e)
             return False

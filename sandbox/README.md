@@ -23,7 +23,7 @@ Optional: `pillow` lets `view_image` downscale big images.
 | `sbx/registry.py` | Durable per-sandbox records with `flock` locks. Sandboxes **survive server restarts**, and several server processes can share one `state_dir`. Only sandboxes in the registry are reachable, so the model can never touch other containers on your machine. |
 | `sbx/tools.py`, `sbx/server.py` | The MCP surface, HTTP transport (bearer token), CLI. |
 | `sbx/defaults.py` | Per-session defaults (`set_defaults`): argument values and output options set once instead of on every call. |
-| `sbx/activity.py` | The optional per-project hand-off log (`[collab] log`): which writable mapping a call touched, and the line written into its `.collab/calls.log`. |
+| `sbx/activity.py` | The optional per-project hand-off log (`[collab] log`): which writable mappings a call touched, and the line written into each one's `.collab/calls.log` (or into the `[collab] fallback` mapping when it touched none). |
 
 Because the backends are stateless, you can still run three separate servers from one install, sharing a state dir:
 `--tools sandbox`, `--tools fs`, `--tools shell`.
@@ -125,12 +125,28 @@ With it on, every file or shell call that touches a **writable** folder mapping 
 
 Fields: UTC time, chat tag, `tool@sandbox`, arguments, outcome (`ok`, `exit N`, `timeout`, `ERR ...`), duration.
 
-* **Which project:** the mapping that contains the call's path (file tools) or working directory (`run_command`); the
-  innermost mapping wins and relative paths resolve against the sandbox workdir. Calls that touch no writable mapping,
-  calls in read-only mappings, calls inside `.collab/` itself (the agents' own notes) and `transfer_files` leave no
-  line. Paths are shown relative to the mapping.
+* **Which project:** every writable mapping the call touches gets a line (one call can touch several). A file tool
+  touches the mappings that contain its paths. A shell command touches the directory it runs in (the one a leading
+  `cd` moves to, else the one it started in) and every absolute path written in its text, so
+  `cd /workspace/myproject && git commit ...` and `cp x /workspace/myproject/x` count wherever the shell was before.
+  Relative paths after a later `cd`, variables and globs are not followed. `transfer_files` counts too, for the
+  sandbox sides of the copy. The innermost mapping wins and relative paths resolve against the sandbox workdir.
+* **Build copies:** `<parent>/build-<project>` (`/workspace/build-myproject` for a mapping at `/workspace/myproject`;
+  `build-<mapping name>` works too) counts as that project. Agents are told to develop in such a copy because the
+  mapping itself is the user's real files, and without this the log would miss almost everything they do. Any
+  other scratch folder is not guessed at.
+* **Not logged:** calls inside `.collab/` itself (the agents' own notes), calls in read-only mappings, and calls that
+  touch no writable mapping at all (`/tmp`, a scratch folder named otherwise). Unless you set a fallback:
+* **Fallback (optional):** `[collab] fallback = "myproject"`, the name of a writable `[mounts.myproject]`, sends those
+  "touches nothing" calls to that mapping's log instead of dropping them. Calls that touch a project still go to the
+  project, calls that name no path (`list_allowed_directories`) and ones that only touch `.collab/` notes are still
+  not logged. It must name a writable mapping (checked at startup), and it only takes effect in sandboxes that have
+  that mapping.
+* **Paths:** shown relative to the mapping the line is written into, and as absolute sandbox paths when they lie
+  outside it (`cwd=/workspace/build-myproject`, `path=/tmp/x`), which is how a reader tells a build copy from the
+  project itself.
 * **Per project, so the same permissions:** the log lives in the mapped folder, so removing the mapping removes access
-  to it, and two agents on different projects never share one. Two agents on the same project do; the chat tag (6 hex
+  to it, and two agents on different projects never share one (a `fallback` mapping's log is the exception). Two agents on the same project do; the chat tag (6 hex
   per MCP session) tells them apart only when the router gives each chat its own session. If it can't recognise your
   chat and gives every call a fresh session, each line gets its own tag (and `set_defaults` is forgotten at once); with
   `"sessions": "shared"` everybody has the same tag (see the sessions note in `router/README.md`). Timestamps and

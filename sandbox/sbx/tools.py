@@ -225,6 +225,29 @@ class Hub:
         except Exception:  # noqa: BLE001 - the log must never fail a call
             pass
 
+    def note_transfer(self, source_sandbox: str | None, destination_sandbox: str | None, source_path: str,
+                      destination_path: str, overwrite: bool, outcome: str, ms: float) -> None:
+        """transfer_files: one line per sandbox side that lands in a project (a single call when both sides are the
+        same sandbox, so a project is not logged twice). The host as a side is never logged. Never raises."""
+        try:
+            args: dict[str, Any] = {"source_path": source_path, "destination_path": destination_path}
+            if source_sandbox:
+                args["source_sandbox"] = source_sandbox
+            if destination_sandbox:
+                args["destination_sandbox"] = destination_sandbox
+            if overwrite:
+                args["overwrite"] = True
+            a, b = self.target(source_sandbox), self.target(destination_sandbox)
+            if a.kind == b.kind and a.name == b.name:
+                self.note_activity(source_sandbox, "transfer_files", args, outcome, ms,
+                                   paths=[source_path, destination_path])
+            else:
+                self.note_activity(source_sandbox, "transfer_files", args, outcome, ms, paths=[source_path])
+                self.note_activity(destination_sandbox, "transfer_files", args, outcome, ms,
+                                   paths=[destination_path])
+        except Exception:  # noqa: BLE001 - the log must never fail a call
+            pass
+
 
 # ------------------------------------------------------------------------ helpers
 
@@ -612,9 +635,12 @@ def register_fs_tools(mcp: FastMCP, hub: Hub) -> None:
             err = str(e)[:300]
             raise
         finally:
+            ms = round((time.monotonic() - t0) * 1000, 1)
             audit.log({"tool": "transfer_files", "from": [source_sandbox, source_path],
                        "to": [destination_sandbox, destination_path], "ok": err is None, "error": err,
-                       "ms": round((time.monotonic() - t0) * 1000, 1)})
+                       "ms": ms})
+            hub.note_transfer(source_sandbox, destination_sandbox, source_path, destination_path, overwrite,
+                              act.error_outcome(err), ms)
 
 
 # --------------------------------------------------------------------- shell tools
@@ -649,7 +675,7 @@ def register_shell_tools(mcp: FastMCP, hub: Hub) -> None:
                    "violations": d.violations if d else [], "ms": round(ms, 1), **extra})
         hub.note_activity(tgt, "run_command", {"cwd": cwd, "command": command},
                           act.shell_outcome(outcome, extra.get("exit_code"), extra.get("timed_out")), ms,
-                          paths=[cwd] if cwd else [])
+                          paths=act.shell_paths(cwd, command))
 
     @tool(read_only=False, destructive=True, open_world=True)
     async def run_command(
