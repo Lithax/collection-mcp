@@ -346,7 +346,7 @@ async def test_e2e_calls_are_logged_in_the_project_they_touched(tmp_path, fake_d
 @pytest.mark.anyio
 async def test_e2e_work_outside_the_mapping_still_reaches_the_project_log(tmp_path, fake_docker):
     cfgfile, ws, proj = e2e_config(tmp_path, collab=True, inside_ws=True)
-    build = ws / "build-proj"                       # the scratch copy the router-sandbox skill tells agents to use
+    build = ws / "build-proj"                       # a legacy scratch copy (older agents developed in one)
     readme = tmp_path / "hostfiles" / "readme.txt"
     async with Session(cfgfile) as c:
         err, out = await c.call("sandbox_create", name="w")

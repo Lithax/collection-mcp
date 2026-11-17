@@ -6,8 +6,8 @@ done. Off unless `[collab] log = true`.
 
 A call is attributed to every writable mapping it touches: the ones containing its path (file tools) or the
 directory a shell command runs in and the absolute paths its text names. Each gets a line in
-`<that mapping's host folder>/.collab/calls.log`. `<parent>/build-<project>`, the scratch copy agents develop in
-because the mapping itself is the user's real files, counts as `<project>`. Calls inside `.collab` itself (the
+`<that mapping's host folder>/.collab/calls.log`. `<parent>/build-<project>`, the scratch copy older agents developed in
+(agents now work in the mapping itself), still counts as `<project>`. Calls inside `.collab` itself (the
 agents' own notes) leave no line. A call that touches no writable mapping at all leaves no line either, unless
 `[collab] fallback` names a writable mapping: then it goes to that one. The server writes on the host as its own
 user, so the files belong to the host user, and the model never learns a host path.
@@ -15,7 +15,7 @@ user, so the files belong to the host user, and the model never learns a host pa
     2026-11-12T19:50:03Z | 3fa9c1 | run_command@work | cwd=router command="pytest -q" | exit 1 | 21004ms
 
 Fields: UTC time | chat (6 hex per live MCP session, best effort) | tool@sandbox | arguments | outcome | duration.
-Paths are shown relative to the mapping, or as absolute sandbox paths when they lie outside it (a build copy, /tmp).
+Paths are shown relative to the mapping, or as absolute sandbox paths when they lie outside it (/tmp, a venv).
 Results are never logged. Commands go through the server's output
 redactor; the file tools already pass sizes instead of file bodies.
 """
@@ -35,7 +35,7 @@ from typing import Any, Callable, Iterable
 
 COLLAB_DIR = ".collab"
 LOG_NAME = "calls.log"
-BUILD_PREFIX = "build-"  # <parent>/build-<project> is the scratch copy of the mapping <parent>/<project>
+BUILD_PREFIX = "build-"  # legacy: <parent>/build-<project> is a scratch copy of the mapping <parent>/<project>
 ARG_LIMIT = 100    # characters kept of one argument value
 ERR_LIMIT = 140    # characters kept of an error message
 LINE_LIMIT = 500   # characters per line; the arguments are cut to fit

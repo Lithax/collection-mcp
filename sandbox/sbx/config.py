@@ -858,7 +858,7 @@ shell = false
 # Hand-off aid for agents that take over from each other. With log = true the server appends one line per
 # file/shell call to .collab/calls.log inside every writable [mounts.*] folder the call touched (a shell command
 # counts for the directory it runs in and the absolute paths in its text), so every project gets its own log and
-# it disappears with the mapping. <parent>/build-<project>, the scratch copy agents develop in, counts as <project>.
+# it disappears with the mapping. <parent>/build-<project>, the scratch copy older agents developed in, still counts as <project>.
 # Calls inside .collab itself are not logged; calls that touch no writable mapping are not logged either, unless
 # fallback names one: then they go to that mapping's log. Written by the server on the host; the model never sees
 # host paths.

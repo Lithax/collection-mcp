@@ -131,20 +131,21 @@ Fields: UTC time, chat tag, `tool@sandbox`, arguments, outcome (`ok`, `exit N`, 
   `cd /workspace/myproject && git commit ...` and `cp x /workspace/myproject/x` count wherever the shell was before.
   Relative paths after a later `cd`, variables and globs are not followed. `transfer_files` counts too, for the
   sandbox sides of the copy. The innermost mapping wins and relative paths resolve against the sandbox workdir.
-* **Build copies:** `<parent>/build-<project>` (`/workspace/build-myproject` for a mapping at `/workspace/myproject`;
-  `build-<mapping name>` works too) counts as that project. Agents are told to develop in such a copy because the
-  mapping itself is the user's real files, and without this the log would miss almost everything they do. Any
-  other scratch folder is not guessed at.
+* **Build copies (legacy):** `<parent>/build-<project>` (`/workspace/build-myproject` for a mapping at
+  `/workspace/myproject`; `build-<mapping name>` works too) still counts as that project, for agents that were told
+  to develop in such a copy. The router-sandbox skill no longer does that: agents work in the mapping itself (build
+  output gitignored, a `.collab/clean.sh` to tidy up), so everything they do is logged. Any other scratch folder is
+  not guessed at.
 * **Not logged:** calls inside `.collab/` itself (the agents' own notes), calls in read-only mappings, and calls that
-  touch no writable mapping at all (`/tmp`, a scratch folder named otherwise). Unless you set a fallback:
+  touch no writable mapping at all (`/tmp`, a scratch folder outside every mapping). Unless you set a fallback:
 * **Fallback (optional):** `[collab] fallback = "myproject"`, the name of a writable `[mounts.myproject]`, sends those
   "touches nothing" calls to that mapping's log instead of dropping them. Calls that touch a project still go to the
   project, calls that name no path (`list_allowed_directories`) and ones that only touch `.collab/` notes are still
   not logged. It must name a writable mapping (checked at startup), and it only takes effect in sandboxes that have
   that mapping.
 * **Paths:** shown relative to the mapping the line is written into, and as absolute sandbox paths when they lie
-  outside it (`cwd=/workspace/build-myproject`, `path=/tmp/x`), which is how a reader tells a build copy from the
-  project itself.
+  outside it (`cwd=/workspace/venv-myproject`, `path=/tmp/x`), which is how a reader tells the project itself from
+  work outside it.
 * **Per project, so the same permissions:** the log lives in the mapped folder, so removing the mapping removes access
   to it, and two agents on different projects never share one (a `fallback` mapping's log is the exception). Two agents on the same project do; the chat tag (6 hex
   per MCP session) tells them apart only when the router gives each chat its own session. If it can't recognise your
